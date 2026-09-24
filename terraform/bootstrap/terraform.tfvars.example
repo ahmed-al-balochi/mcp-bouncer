@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and fill in your own values.
+# terraform.tfvars is gitignored: it describes your account, not the project.
+
+aws_region = "eu-west-1"
+
+# A subdomain of a domain you already own. You will delegate it to this zone's
+# name servers at your registrar after the first apply.
+dns_zone_name = "bouncer.example.com"
+
+# Optional.
+# project_name          = "mcp-bouncer"
+# image_retention_count = 5
+# tags                  = { Owner = "you" }

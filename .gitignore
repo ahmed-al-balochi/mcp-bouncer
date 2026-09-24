@@ -1,0 +1,34 @@
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Terraform. The lock file IS committed on purpose -- it pins provider hashes.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+
+# Describes your account and your domain, not the project.
+terraform.tfvars
+*.auto.tfvars
+
+# Local secrets for the development token source.
+tokens.json
+.env
+
+# Local working documents, not part of the repo: the session handoff and carried
+# findings. Anything *.local.md is scaffolding for building this, not a deliverable.
+*.local.md

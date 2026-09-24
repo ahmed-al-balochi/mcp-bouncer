@@ -1,0 +1,71 @@
+# mcp-bouncer policy. This file is the only place rules live. If anything below is
+# invalid, the gate refuses to start rather than running on a policy it had to
+# guess at.
+
+defaults:
+  # A tool matching nothing under `tools:` is classified `unknown`. `block` is
+  # the only accepted value: a gate that allows what it cannot classify is not a
+  # gate.
+  unclassified: block
+  # MCP tool annotations are untrusted hints from the upstream server. They may
+  # raise a classification and never lower it. `escalate-only` is the only
+  # accepted value.
+  annotations: escalate-only
+
+limits:
+  # Approved destructive actions allowed per caller per rolling hour. Beyond
+  # this, destructive calls are blocked until a human runs `gate reset <caller>`.
+  destructive_per_hour: 3
+  # How long an approval stays usable. It is still one-shot within that window.
+  approval_ttl_minutes: 10
+
+tools:
+  # Keys are tool names. fnmatch globs are allowed (for example "wiki.*").
+  # An exact name always wins; otherwise the first matching glob in file order
+  # wins, so list specific names above broader patterns.
+  #
+  # write_page is `write`, not `destructive`, on the assumption that the wiki
+  # keeps revision history, so an overwrite is revertable. If the store behind
+  # it has no versions, reclassify it to `destructive` here.
+  "wiki.read_page": read
+  "wiki.write_page": write
+  "wiki.delete_page": destructive
+
+actions:
+  # What to do with each classification. `approve` means park the call and wait
+  # for a human.
+  read: pass
+  write: pass
+  destructive: approve
+
+teams:
+  # A team may override tool classifications, actions and limits, but ONLY to
+  # tighten: raise a classification (read -> write -> destructive), make an
+  # action stricter (pass -> approve -> block), or lower its own destructive cap
+  # or approval TTL. Any loosening -- a softer classification, a higher cap, a
+  # longer TTL, or naming a tool the baseline does not classify -- makes the gate
+  # refuse to boot. A team cannot touch `defaults`, so deny-by-default for
+  # unknown tools is immutable. Adding a team is this one block plus one token;
+  # no code changes (R25).
+  CustomerChat:
+    # Customer facing, so the tightest posture. A wiki edit is visible to a
+    # customer the moment it lands, so even a revertable overwrite is promoted
+    # to destructive and parked for a human -- the revision history that makes it
+    # `write` at baseline does not undo what a customer already saw. The
+    # destructive allowance drops to a single approved action per hour, and
+    # approvals expire in half the baseline window so a stale grant cannot be
+    # redeemed long after it was reviewed.
+    tools:
+      "wiki.write_page": destructive
+    limits:
+      destructive_per_hour: 1
+      approval_ttl_minutes: 5
+
+  DevChat:
+    # Internal tooling, so more latitude: writes still pass straight through, as
+    # at baseline. The one tightening is a lower destructive cap -- internal use
+    # is no reason to allow more mass-deletion than the baseline, and two per
+    # hour is enough headroom for routine cleanup while still bounding a runaway
+    # agent.
+    limits:
+      destructive_per_hour: 2
