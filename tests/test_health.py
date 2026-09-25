@@ -174,6 +174,38 @@ def test_health_headers_reveal_nothing_on_a_real_listener(
         assert needle not in body
 
 
+def test_run_http_suppresses_everything_that_would_pollute_the_log_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """R33: stdout must be JSON per line, and R31: the health response must not
+    announce the server.
+
+    Asserting on what `run_http` passes, rather than on the constant, because the
+    defect this guards against is a caller that reaches for `gate.run` directly
+    and silently gets uvicorn's defaults back. Captured by substituting run.
+    """
+    captured: dict[str, Any] = {}
+
+    class _FakeGate:
+        def run(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    run_http(_FakeGate(), host="127.0.0.1", port=1234)  # type: ignore[arg-type]
+
+    assert captured["transport"] == "http"
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 1234
+    # The ASCII banner and upgrade notice would land in the JSON log stream.
+    assert captured["show_banner"] is False
+
+    config = captured["uvicorn_config"]
+    # Sent on every response, including the unauthenticated health endpoint.
+    assert config["server_header"] is False
+    assert config["date_header"] is False
+    # Plain text, so it would interleave unparsable lines into JSON output.
+    assert config["access_log"] is False
+
+
 def test_health_is_open_while_tool_calls_still_require_a_token(
     http_gate: tuple[str, str],
 ):

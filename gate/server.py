@@ -59,7 +59,22 @@ _HEALTH_BODY = "ok"
 # the value is visible in one place and so tests can assert the production path
 # uses it rather than reimplementing it. See `run_http`.
 UVICORN_CONFIG: Mapping[str, Any] = MappingProxyType(
-    {"server_header": False, "date_header": False}
+    {
+        # Suppress the `Server:` and `Date:` headers uvicorn sends by default.
+        # They apply to every response including the unauthenticated health
+        # endpoint, and an ALB does not strip them.
+        "server_header": False,
+        "date_header": False,
+        # uvicorn's access log is plain text, so it would interleave unparsable
+        # lines into a stream that is otherwise JSON per line (R33). It is also
+        # mostly noise here: a load balancer probes the health endpoint every few
+        # seconds forever, and the gate's own decision log already records every
+        # tool call with its caller, classification and outcome. Routing uvicorn
+        # through the JSON formatter instead would keep request-level detail, at
+        # the cost of owning a uvicorn log_config; for this component the
+        # decision log is the record that matters.
+        "access_log": False,
+    }
 )
 
 
@@ -161,11 +176,18 @@ def run_http(gate: FastMCPProxy, *, host: str, port: int) -> None:
     precisely the disclosure the health route otherwise goes out of its way to
     avoid (R31). An ALB does not strip them, so it has to happen here. fastmcp
     merges this dict over its own uvicorn defaults.
+
+    `show_banner=False` for the same reason the access log is off: the banner is
+    several lines of ASCII art and an upgrade advertisement, and it lands in the
+    same stdout stream that is supposed to be JSON per line (R33). It is set here
+    rather than only via the environment so the production path is correct however
+    the gate is launched.
     """
     gate.run(
         transport="http",
         host=host,
         port=port,
+        show_banner=False,
         uvicorn_config=dict(UVICORN_CONFIG),
     )
 

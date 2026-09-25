@@ -23,9 +23,17 @@ FROM python:3.12-slim
 # PYTHONUNBUFFERED: flush stdout/stderr immediately so CloudWatch sees log lines
 #   as they happen rather than when a buffer fills (R33).
 # PIP_NO_CACHE_DIR: no wheel cache baked into a layer we will never reuse.
+# FASTMCP_SHOW_SERVER_BANNER / FASTMCP_ENABLE_RICH_LOGGING: the framework
+#   otherwise prints several lines of ASCII art, an upgrade advertisement, and
+#   rich-formatted log lines to the same stdout stream that is supposed to be
+#   JSON per line (R33). `run_http` also passes show_banner=False, so the
+#   suppression does not depend on these being set; they cover any other entry
+#   point and the framework's own logger, which the code cannot reach.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    FASTMCP_SHOW_SERVER_BANNER=false \
+    FASTMCP_ENABLE_RICH_LOGGING=false
 
 WORKDIR /app
 
@@ -51,7 +59,14 @@ deps = list(project.get("dependencies", []))
 deps += project.get("optional-dependencies", {}).get("aws", [])
 print("\n".join(deps))
 PY
-RUN pip install --upgrade pip && pip install -r /tmp/requirements.txt
+# `--retries`/`--timeout` are deliberately short. pip's defaults retry five
+# times with a long timeout, so a build on a machine whose container DNS is
+# broken -- common behind a corporate proxy or a daemon that overrides
+# /etc/resolv.conf -- spends about five minutes producing a retry storm before
+# admitting the index was never reachable. Failing in seconds with a readable
+# error is worth far more than tolerating a flaky network during a build.
+RUN pip install --retries 1 --timeout 15 --upgrade pip \
+ && pip install --retries 1 --timeout 15 -r /tmp/requirements.txt
 
 # --- application layer -----------------------------------------------------
 # Now copy the source and install the package itself without re-resolving
@@ -60,7 +75,7 @@ RUN pip install --upgrade pip && pip install -r /tmp/requirements.txt
 COPY gate/ ./gate/
 COPY demo/ ./demo/
 COPY policy.yaml ./policy.yaml
-RUN pip install --no-deps .
+RUN pip install --retries 1 --timeout 15 --no-deps .
 
 # --- non-root user (R35) ---------------------------------------------------
 # Run as an unprivileged user. Created after installs so the site-packages and
