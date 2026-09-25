@@ -24,12 +24,13 @@ from typing import Any, Iterator
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.exceptions import ClientError, MCPError
 
 from demo.wiki_server import build_server
 from gate.audit import AuditLog
 from gate.cli import main as gate_cli
 from gate.identity import LOCAL_TOKENS_ENV
-from gate.middleware import APPROVAL_REQUIRED, BLOCKED
+from gate.middleware import APPROVAL_REQUIRED
 from gate.server import build_gate
 
 # Test-fixture tokens, not credentials. Two callers on two teams so their
@@ -110,6 +111,39 @@ def call(
     return asyncio.run(_call())
 
 
+# Under the amended R18, HTTP auth is enforced on the WHOLE session by fastmcp's
+# native auth seam, which runs before the MCP session manager. So a request
+# without a valid token cannot even `initialize`: the client raises an
+# MCPError/transport error during session setup rather than returning an error
+# ToolResult. `session_rejected` captures that "the door never opened" outcome,
+# which is stronger than the old "the call returned BLOCKED" outcome and is
+# exactly what A6 (amended) requires.
+SESSION_REJECTED = (MCPError, ClientError)
+
+
+def initialize_rejected(url: str, token: str | None) -> bool:
+    """True iff a session with this token cannot initialize or list tools.
+
+    Exercises the two session operations R18 now covers -- `initialize` and
+    `tools/list` -- not a tool call, because the point is that the catalogue is
+    unreachable without a token, not merely that a call is blocked.
+    """
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+
+    async def _run() -> Any:
+        transport = StreamableHttpTransport(url, headers=headers)
+        async with Client(transport) as client:
+            # Entering the context performs `initialize`; list_tools is the
+            # catalogue read. Either failing before returning is a rejection.
+            return await client.list_tools()
+
+    try:
+        asyncio.run(_run())
+        return False
+    except SESSION_REJECTED:
+        return True
+
+
 def text_of(result: Any) -> str:
     return result.content[0].text
 
@@ -120,31 +154,84 @@ def approval_id_from(result: Any) -> str:
     return message.split(f"{APPROVAL_REQUIRED} id=")[1].split()[0]
 
 
-# --- rejection at the door (A6) -------------------------------------------
+# --- rejection at the door (A6, amended R18: the SESSION, not just the call) --
 
 
-def test_a_call_with_no_token_is_rejected(http_gate: str):
-    result = call(http_gate, None, "wiki.read_page", {"title": "home"})
-    assert result.is_error is True
-    assert BLOCKED in text_of(result)
+def test_a_session_with_no_token_cannot_initialize_or_list_tools(http_gate: str):
+    """No Authorization header: the session never initializes, so the catalogue
+    is unreachable. This is stronger than the old "the tool call is blocked":
+    an unauthenticated client cannot even discover what tools exist (R18)."""
+    assert initialize_rejected(http_gate, None) is True
 
 
-def test_a_call_with_an_unknown_token_is_rejected(http_gate: str):
-    result = call(http_gate, "tok-not-real", "wiki.read_page", {"title": "home"})
-    assert result.is_error is True
-    assert BLOCKED in text_of(result)
+def test_a_session_with_an_unknown_token_cannot_initialize_or_list_tools(
+    http_gate: str,
+):
+    assert initialize_rejected(http_gate, "tok-not-real") is True
 
 
 def test_a_malformed_authorization_header_is_rejected(http_gate: str):
-    # A raw token with no Bearer scheme is malformed.
-    result = call(http_gate, None, "wiki.read_page", {"title": "home"})
-    assert result.is_error is True
+    """A `Basic` scheme and an empty `Bearer ` are both malformed: neither is a
+    valid bearer token, so the session is rejected exactly as a missing one is,
+    and the client cannot tell the three cases apart (oracle-safe)."""
+
+    def rejected_with_raw_header(raw: str) -> bool:
+        async def _run() -> Any:
+            transport = StreamableHttpTransport(
+                http_gate, headers={"Authorization": raw}
+            )
+            async with Client(transport) as client:
+                return await client.list_tools()
+
+        try:
+            asyncio.run(_run())
+            return False
+        except SESSION_REJECTED:
+            # Rejected server-side: the token verifier returned no identity, so
+            # the session was refused with a 401.
+            return True
+        except (RuntimeError, ValueError):
+            # Rejected client-side: an empty `Bearer ` is an illegal HTTP header
+            # value, so the client refuses to even transmit it. Either way no
+            # session is established, which is the property under test.
+            return True
+
+    # Wrong scheme: server-side rejection.
+    assert rejected_with_raw_header("Basic dXNlcjpwYXNz") is True
+    # Empty bearer token: rejected (client refuses the illegal header value).
+    assert rejected_with_raw_header("Bearer ") is True
+    # A bare token with no scheme is also malformed and refused.
+    assert rejected_with_raw_header(DEV_TOKEN) is True
 
 
-def test_a_valid_token_lets_a_read_through(http_gate: str):
+def test_a_valid_token_initializes_lists_tools_and_reads(http_gate: str):
+    """The positive path across a real socket: a valid token establishes the
+    session, lists the catalogue, and a read tool call returns the upstream
+    content with the correct caller in force."""
+    # Session + catalogue listing succeed.
+    assert initialize_rejected(http_gate, DEV_TOKEN) is False
+
+    # And a read call runs.
     result = call(http_gate, DEV_TOKEN, "wiki.read_page", {"title": "home"})
     assert result.is_error is False
     assert "Welcome to the demo wiki." in text_of(result)
+
+
+def test_the_read_call_records_the_authenticated_caller(
+    http_gate: str, tmp_path: Path
+):
+    """The caller the middleware resolves from the SAME Authorization header the
+    session verifier accepted is the one attributed in the audit log -- proving
+    the header reaches on_call_tool's get_http_headers even with the auth
+    middleware installed (defence in depth is intact)."""
+    db_path = tmp_path / "http-gate.db"
+    result = call(http_gate, DEV_TOKEN, "wiki.read_page", {"title": "home"})
+    assert result.is_error is False
+
+    entries = AuditLog(db_path).entries()
+    reads = [e for e in entries if e.tool == "wiki.read_page"]
+    assert reads, "the read was not audited"
+    assert reads[-1].caller == "dev-agent"
 
 
 # --- the tightening override takes effect end to end (R23, R24) -----------
@@ -220,15 +307,28 @@ def test_a_token_never_appears_in_the_audit_log_or_an_error(
     http_gate: str, tmp_path: Path
 ):
     """Assert, do not assume: exercise good and bad tokens, then scan the audit
-    log and every returned message for any token value."""
+    log and every message a caller could see (error text or raised exception)
+    for any token value."""
     db_path = tmp_path / "http-gate.db"
 
     good = call(http_gate, DEV_TOKEN, "wiki.read_page", {"title": "home"})
-    bad = call(http_gate, "tok-not-real", "wiki.read_page", {"title": "home"})
-    missing = call(http_gate, None, "wiki.read_page", {"title": "home"})
+    assert good.is_error is False
 
-    for result in (good, bad, missing):
-        message = text_of(result)
+    # Bad and missing tokens are now rejected at the session layer, so they
+    # surface as raised exceptions rather than error ToolResults. The exception
+    # text a caller sees must not carry the token either.
+    seen_messages: list[str] = [text_of(good)]
+
+    def capture(token: str | None) -> None:
+        try:
+            call(http_gate, token, "wiki.read_page", {"title": "home"})
+        except SESSION_REJECTED as error:
+            seen_messages.append(str(error))
+
+    capture("tok-not-real")
+    capture(None)
+
+    for message in seen_messages:
         assert DEV_TOKEN not in message
         assert CUSTOMER_TOKEN not in message
         assert "tok-not-real" not in message
@@ -241,3 +341,66 @@ def test_a_token_never_appears_in_the_audit_log_or_an_error(
             assert token not in entry.caller
             assert token not in entry.tool
             assert token not in entry.args_hash
+
+
+def test_the_token_source_is_read_once_at_boot_over_http(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
+) -> None:
+    """The session verifier and the per-call resolver share ONE token table.
+
+    Building them independently read the source twice at boot: two Secrets
+    Manager calls in the deployed task, and a rotation landing between them
+    would leave the session layer and the per-call layer holding different
+    tables. Counting loads pins that there is exactly one.
+    """
+    import gate.identity as identity_module
+
+    monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
+    loads: list[int] = []
+    real_load = identity_module._load_tokens
+
+    def counting_load(*args: Any, **kwargs: Any) -> Any:
+        loads.append(1)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(identity_module, "_load_tokens", counting_load)
+    build_gate(
+        build_server(),
+        policy_path=policy_path,
+        db_path=tmp_path / "once.db",
+        transport="http",
+    )
+    assert len(loads) == 1
+
+
+def test_the_per_call_check_blocks_even_if_the_session_layer_never_ran(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
+) -> None:
+    """Defence in depth: `on_call_tool` authenticates on its own.
+
+    The in-memory transport reaches the gate's middleware WITHOUT passing
+    through the HTTP app, so fastmcp's session-level verifier never runs and no
+    Authorization header exists. That is exactly the case the second layer is
+    for -- the outer check missing, misconfigured, or bypassed. Once session
+    auth landed, every HTTP test was rejected before the middleware, so without
+    this test the per-call check could wave calls through unnoticed.
+    """
+    monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
+    db_path = tmp_path / "depth.db"
+    gate = build_gate(
+        build_server(), policy_path=policy_path, db_path=db_path, transport="http"
+    )
+
+    async def call() -> Any:
+        async with Client(gate) as client:
+            return await client.call_tool(
+                "wiki.read_page", {"title": "home"}, raise_on_error=False
+            )
+
+    result = asyncio.run(call())
+    assert result.is_error
+    rows = AuditLog(db_path).entries()
+    # Rejected before classification: attributed to no one, recorded as a block.
+    assert [(row.caller, row.tool, row.decision) for row in rows] == [
+        ("<unreadable>", "wiki.read_page", "block")
+    ]

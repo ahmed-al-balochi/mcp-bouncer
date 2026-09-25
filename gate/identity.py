@@ -45,6 +45,8 @@ import os
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+
 logger = logging.getLogger("bouncer.identity")
 
 # Selection knob, BOUNCER_-prefixed to match BOUNCER_STORE / BOUNCER_DB /
@@ -168,7 +170,18 @@ class BearerTokenIdentityResolver:
             # token value.
             logger.warning("authentication rejected: missing or malformed Authorization header")
             raise AuthenticationError()
+        return self.authenticate(token)
 
+    def authenticate(self, token: str) -> Identity:
+        """Turn a raw bearer token into an `Identity`, or raise.
+
+        Factored out of `resolve()` so the fastmcp session-level verifier
+        (`BouncerTokenVerifier`) authenticates against the SAME token table and
+        the SAME `hmac.compare_digest` matching this resolver uses, rather than
+        keeping a second copy of either (R21). `resolve()` owns header parsing;
+        this owns the token-to-identity decision. Both funnel through `_match`,
+        so there is exactly one comparison and one table in the process.
+        """
         record = self._match(token)
         if record is None:
             logger.warning("authentication rejected: unrecognised bearer token")
@@ -431,3 +444,62 @@ def _parse_json_object(text: str, where: str) -> Mapping[str, object]:
 def _read_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+class BouncerTokenVerifier(TokenVerifier):
+    """Authenticate the whole MCP session, not just tool calls (R18 amended, A6).
+
+    Why this exists at all: `GateMiddleware.on_call_tool` authenticates every
+    tool call, but a `Middleware` hook only fires for tool calls. Over HTTP the
+    session's `initialize` handshake and its `tools/list` catalogue listing are
+    NOT tool calls, so nothing behind that hook can see them; without a
+    session-level check an unauthenticated client could open a session and read
+    the whole tool catalogue before it ever tried a call it could not make.
+    fastmcp's native auth seam runs BEFORE the MCP session manager -- its
+    `AuthenticationMiddleware`/`RequireAuthMiddleware` gate the streamable-HTTP
+    route itself -- so wiring a verifier there is the only place that covers
+    `initialize` and `tools/list` too. This is the single component that adapts
+    fastmcp's token seam to ours.
+
+    Why it delegates rather than re-implements: the token table and the
+    `hmac.compare_digest` matching already live on `BearerTokenIdentityResolver`
+    and must stay a single seam (R21). Duplicating either here would create a
+    second place a token is compared and a second copy of the table to keep in
+    sync -- exactly the drift R21 forbids. So the verifier holds the SAME
+    resolver `GateMiddleware` holds and calls its `authenticate()`; there is one
+    table and one comparison in the process.
+
+    Why it returns `None` on failure instead of raising: that is fastmcp's
+    contract (`TokenVerifier.verify_token`), and `BearerAuthBackend` turns a
+    `None` into the 401 with a deliberately-uninformative body. Translating our
+    `AuthenticationError` into `None` keeps the oracle-safe property at the HTTP
+    layer too: a wrong token and a malformed header both become the same 401.
+    The token is never logged here; the resolver's own rejection log records the
+    shape of the failure, never the credential.
+    """
+
+    def __init__(self, resolver: BearerTokenIdentityResolver) -> None:
+        # No base_url / resource_base_url on purpose: with neither set, fastmcp
+        # registers NO `.well-known/oauth-protected-resource` route and the 401's
+        # WWW-Authenticate advertises no resource-metadata URL, so adding auth
+        # opens no new unauthenticated disclosure surface (verified in
+        # fastmcp/server/http.py: resource_metadata_url is None when
+        # _get_resource_url() returns None).
+        super().__init__()
+        self._resolver = resolver
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Verify a session-level bearer token via the shared resolver.
+
+        `scopes=[]` because the gate does not model OAuth scopes: authorisation
+        is the policy engine's job, keyed on the resolved caller/team, not on
+        token scopes. `client_id` carries the authenticated caller so it is
+        available to anything downstream that inspects the fastmcp auth context;
+        the authoritative identity the gate acts on is still re-resolved by
+        `GateMiddleware` from the same header (defence in depth).
+        """
+        try:
+            identity = self._resolver.authenticate(token)
+        except AuthenticationError:
+            return None
+        return AccessToken(token=token, client_id=identity.caller, scopes=[])

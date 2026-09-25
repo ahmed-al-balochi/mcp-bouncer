@@ -75,6 +75,9 @@ None may regress.
 
 - **R18** Callers authenticate with a bearer token. The token maps to a caller
   identity; an unknown or missing token is rejected before classification.
+  Over HTTP this covers the whole MCP session, including `initialize` and
+  catalogue listing, not only tool calls; the health endpoint (R31) is the sole
+  unauthenticated route.
 - **R19** Tokens are never in the repo, never in the image, and never in
   Terraform state as plaintext input. They are generated at provision time and
   stored in AWS Secrets Manager. The container receives the secret's ARN or name
@@ -228,8 +231,9 @@ Verifiable, in order:
 - **A4** A grant for one set of arguments does not release a different set.
 - **A5** A poisoned policy engine blocks reads, writes and destructive calls
   alike.
-- **A6** An unknown bearer token is rejected. Two tokens map to two distinct
-  callers, and their destructive counters are independent.
+- **A6** An unknown bearer token is rejected. Over HTTP, a request without a
+  valid token cannot initialise a session or list tools. Two tokens map to two
+  distinct callers, and their destructive counters are independent.
 - **A7** A team override that loosens the baseline prevents boot.
 - **A8** The DynamoDB store passes the same store test suite as SQLite.
 - **A9** `terraform apply` in `bootstrap/` then `app/` produces a reachable

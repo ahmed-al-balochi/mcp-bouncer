@@ -118,9 +118,18 @@ Adding a team is one block in `policy.yaml` plus one token. No code change.
 
 Over **stdio** the client spawned the gate process, so the spawning process's
 identity *is* the identity and `--caller` is trusted. Over **HTTP** there is a
-network boundary, so an `Authorization: Bearer` token is mandatory, with no
-fallback — and if no token source is configured at all, the gate refuses to boot
-rather than authenticating nobody and passing everybody.
+network boundary, so an `Authorization: Bearer` token is mandatory for the
+**whole MCP session** — a request without a valid token cannot even open a
+session, so it can neither `initialize` nor list the tool catalogue, let alone
+call a tool. The one exception is the unauthenticated health endpoint (below).
+There is no fallback, and if no token source is configured at all, the gate
+refuses to boot rather than authenticating nobody and passing everybody.
+
+Two layers enforce this on HTTP, on purpose: the session-level bearer check runs
+before the MCP session manager (so `initialize` and `tools/list` are covered),
+and the gate's own per-call check re-resolves the same token as defence in
+depth. The health endpoint (`/health`) is the sole unauthenticated route; it
+returns a fixed `ok` and reveals nothing.
 
 ## Layout
 

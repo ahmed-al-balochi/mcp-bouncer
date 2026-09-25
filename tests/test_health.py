@@ -30,11 +30,11 @@ from typing import Any, Iterator
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.exceptions import ClientError, MCPError
 from starlette.testclient import TestClient
 
 from demo.wiki_server import build_server
 from gate.identity import LOCAL_TOKENS_ENV
-from gate.middleware import BLOCKED
 from gate.server import HEALTH_PATH, build_gate, run_http
 
 DEV_TOKEN = "tok-dev-dddddddddddddddd"
@@ -206,25 +206,121 @@ def test_run_http_suppresses_everything_that_would_pollute_the_log_stream(
     assert config["access_log"] is False
 
 
-def test_health_is_open_while_tool_calls_still_require_a_token(
+def test_health_is_open_while_the_mcp_session_still_requires_a_token(
     http_gate: tuple[str, str],
 ):
-    """The same running server answers /health unauthenticated AND rejects an
-    unauthenticated tool call. Opening health did not open a tool path."""
+    """The same running server answers /health unauthenticated AND refuses to
+    open an MCP session without a token. Opening health did not open a tool
+    path: under the amended R18 the session itself cannot initialize, so an
+    unauthenticated client cannot even list tools."""
     base, mcp_url = http_gate
 
     # Health: no Authorization header, still 200.
     with urllib.request.urlopen(f"{base}{HEALTH_PATH}", timeout=5) as response:
         assert response.status == 200
 
-    # Tool call over the same server, no token: rejected before it can run.
-    async def _call() -> Any:
+    # MCP over the same server, no token: the session is rejected before it can
+    # initialize, so listing tools raises rather than returning a catalogue.
+    async def _list() -> Any:
         transport = StreamableHttpTransport(mcp_url, headers={})  # no token
         async with Client(transport) as client:
-            return await client.call_tool(
-                "wiki.read_page", {"title": "home"}, raise_on_error=False
-            )
+            return await client.list_tools()
 
-    result = asyncio.run(_call())
-    assert result.is_error is True
-    assert BLOCKED in result.content[0].text
+    with pytest.raises((MCPError, ClientError)):
+        asyncio.run(_list())
+
+
+# --- the 401 itself leaks nothing (R18 disclosure checks) -----------------
+
+
+def _post_mcp_unauthenticated(mcp_url: str) -> tuple[int, dict[str, str], str]:
+    """POST an MCP initialize to the endpoint with no token, on the real listener.
+
+    Returns (status, headers-lower, body). urllib raises HTTPError on a 4xx, so
+    the error object -- which is itself the response -- is used to read the 401's
+    headers and body exactly as they went over the socket.
+    """
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "0"},
+            },
+        }
+    ).encode()
+    request = urllib.request.Request(
+        mcp_url.rstrip("/"),  # avoid the 307 that /mcp/ -> /mcp issues for POST
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return (
+                response.status,
+                {k.lower(): v for k, v in response.headers.items()},
+                response.read().decode(),
+            )
+    except urllib.error.HTTPError as error:
+        return (
+            error.code,
+            {k.lower(): v for k, v in error.headers.items()},
+            error.read().decode(),
+        )
+
+
+def test_the_401_reveals_no_token_config_or_resource_metadata(
+    http_gate: tuple[str, str],
+):
+    """The unauthenticated 401 must leak nothing useful.
+
+    No base_url is configured, so fastmcp advertises no protected-resource
+    metadata URL in WWW-Authenticate and registers no well-known route. The body
+    is the SDK's fixed `invalid_token` shape -- no token, no team, no backend, no
+    file names.
+    """
+    _, mcp_url = http_gate
+    status, headers, body = _post_mcp_unauthenticated(mcp_url)
+
+    assert status == 401
+
+    # WWW-Authenticate challenges as Bearer but advertises no resource-metadata
+    # URL, because none is configured -- so it points a client at nothing.
+    www_auth = headers.get("www-authenticate", "")
+    assert www_auth.lower().startswith("bearer")
+    assert "resource_metadata" not in www_auth
+
+    # The body and headers leak no token or configuration.
+    for needle in (*FORBIDDEN_IN_HEALTH, DEV_TOKEN):
+        assert needle not in body, f"401 body leaked {needle!r}"
+        assert needle not in www_auth, f"WWW-Authenticate leaked {needle!r}"
+
+
+def test_the_401_carries_no_server_or_date_header_on_the_real_listener(
+    http_gate: tuple[str, str],
+):
+    """The Server:/Date: suppression that applies to /health must apply to the
+    401 too -- it is served by the same uvicorn, so run_http's header
+    suppression covers it."""
+    _, mcp_url = http_gate
+    status, headers, _ = _post_mcp_unauthenticated(mcp_url)
+
+    assert status == 401
+    assert "server" not in headers, "the 401 announces the ASGI server"
+    assert "date" not in headers
+
+
+def test_no_unauthenticated_well_known_route_is_registered(asgi_app: Any):
+    """Adding auth must not register an unauthenticated
+    /.well-known/oauth-protected-resource route: with no base_url, fastmcp
+    creates none, so the probe 404s rather than serving discovery metadata."""
+    with TestClient(asgi_app) as client:
+        response = client.get("/.well-known/oauth-protected-resource")
+    assert response.status_code == 404

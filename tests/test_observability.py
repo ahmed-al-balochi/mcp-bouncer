@@ -143,10 +143,12 @@ def test_an_authentication_rejection_logs_no_token(
 ):
     """Push a real bad token across a real socket and prove it is not in the log.
 
-    The capture has to be installed inside the server thread's process (same
-    process here) BEFORE the request, and read after. The sentinel token is
-    unknown to the token source, so the call is rejected -- and the rejection
-    path must log the shape of the failure, never the credential.
+    Under the amended R18 the bad token is rejected at the session layer (before
+    the MCP session manager), so the client raises rather than getting an error
+    ToolResult. The rejection is logged -- by the shared resolver's own warning,
+    which records the SHAPE of the failure ("unrecognised bearer token") and
+    never the credential. The capture must be installed in this process before
+    the request and read after.
     """
     monkeypatch.setenv(
         LOCAL_TOKENS_ENV,
@@ -172,27 +174,30 @@ def test_an_authentication_rejection_logs_no_token(
     time.sleep(1.0)
 
     try:
+        raised = False
+
         async def _run() -> Any:
             transport = StreamableHttpTransport(
                 f"http://127.0.0.1:{port}/mcp/",
                 headers={"Authorization": f"Bearer {SENTINEL_TOKEN}"},
             )
             async with Client(transport) as client:
-                return await client.call_tool(
-                    "wiki.read_page", {"title": SENTINEL_ARG}, raise_on_error=False
-                )
+                # `initialize` happens on context entry; the session is rejected
+                # there because the token is unknown.
+                return await client.list_tools()
 
-        result = asyncio.run(_run())
-        assert result.is_error is True
+        try:
+            asyncio.run(_run())
+        except Exception:
+            raised = True
+
+        assert raised, "an unknown token must be rejected at the session layer"
 
         dump = buffer.getvalue()
         assert SENTINEL_TOKEN not in dump, "a bearer token leaked into the log"
         assert SENTINEL_ARG not in dump, "an argument value leaked into the log"
-        rejections = [
-            entry for entry in _lines(buffer) if entry.get("event") == "auth_rejected"
-        ]
-        assert rejections, "the rejection was not logged"
-        assert rejections[-1]["reason"] == "authentication_failed"
+        # The rejection was recorded, by shape, without the credential.
+        assert "unrecognised bearer token" in dump, "the rejection was not logged"
     finally:
         logger.handlers, logger.level, logger.propagate = saved
 

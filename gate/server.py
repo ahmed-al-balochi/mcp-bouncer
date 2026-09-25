@@ -6,10 +6,14 @@ the older `FastMCP.as_proxy`, and interception is a `Middleware` subclass with a
 `on_call_tool` hook. The gate installs exactly one such hook.
 
 Identity is resolved by transport (see gate.identity): stdio trusts `--caller`,
-HTTP authenticates a bearer token. `build_gate` constructs the resolver at boot
-and injects it into the one middleware, so the middleware never learns how
-authentication works (R21). A misconfigured identity source refuses the boot,
-exactly as a bad policy does (R17).
+HTTP authenticates a bearer token. Over HTTP the token is enforced TWICE and on
+purpose: fastmcp's native auth seam (`auth=BouncerTokenVerifier`, wired only on
+the HTTP transport) gates the whole session -- `initialize` and `tools/list`
+included -- before the MCP session manager runs, and `GateMiddleware` re-resolves
+the same header per tool call as defence in depth. `build_gate` constructs the
+resolver at boot and injects it into the one middleware, so the middleware never
+learns how authentication works (R21). A misconfigured identity source refuses
+the boot, exactly as a bad policy does (R17).
 """
 
 from __future__ import annotations
@@ -27,7 +31,15 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
 from gate import observability
-from gate.identity import IDENTITY_ENV, SECRET_ID_ENV, build_identity_resolver
+from gate.identity import (
+    IDENTITY_ENV,
+    SECRET_ID_ENV,
+    BearerTokenIdentityResolver,
+    BouncerTokenVerifier,
+    IdentityConfigError,
+    IdentityResolver,
+    build_identity_resolver,
+)
 from gate.middleware import ANONYMOUS_CALLER, GateMiddleware
 from gate.registry import known_teams, load_registry
 from gate.storage import (
@@ -156,10 +168,46 @@ def build_gate(
     )
     audit = build_audit_log(db_path=db_path)
 
-    proxy = create_proxy(upstream, name=name)
+    proxy = create_proxy(upstream, name=name, **_http_auth(transport, identity_resolver))
     proxy.add_middleware(GateMiddleware(registry, approvals, audit, identity_resolver))
     _install_health_route(proxy)
     return proxy
+
+
+def _http_auth(transport: str, identity_resolver: IdentityResolver) -> dict[str, Any]:
+    """The whole-session authentication wiring -- HTTP only. THE mutation target.
+
+    Returned as kwargs for `create_proxy`, which forwards `**settings` to
+    `FastMCPProxy` and thence to `FastMCP.__init__(auth=...)` (verified in
+    fastmcp/server/server.py:2501 create_proxy -> providers/proxy.py:1471
+    super().__init__(**kwargs) -> server.py:293 auth param, :433 self.auth).
+    When `auth` is set, fastmcp wraps the streamable-HTTP MCP route in
+    RequireAuthMiddleware, so `initialize` and `tools/list` -- not only tool
+    calls -- require a valid token (R18 amended, A6). This is deliberately the
+    ONE place session auth is wired: removing this line must make the
+    unauthenticated-session tests fail.
+
+    Stdio/in-memory is left entirely alone: no `auth` kwarg is passed, and even
+    if it were, `run(transport="stdio")` builds no HTTP app and so never
+    constructs RequireAuthMiddleware. Restricting the kwarg to the HTTP branch
+    keeps the trusted-transport path provably unchanged.
+
+    The verifier wraps the SAME resolver instance `GateMiddleware` receives,
+    rather than building its own from the token source. Building a second one
+    would read the token source twice at boot -- two Secrets Manager calls, and
+    if the secret rotated between them the session layer and the per-call layer
+    would hold different tables. One instance means one table in the process.
+    """
+    if transport != HTTP_TRANSPORT:
+        return {}
+    if not isinstance(identity_resolver, BearerTokenIdentityResolver):
+        # Unreachable while build_identity_resolver keeps its contract, but if it
+        # ever broke, serving an HTTP session with no verifier would be the open
+        # door R13 forbids. Refuse to boot instead.
+        raise IdentityConfigError(
+            "HTTP transport requires a bearer-token identity resolver"
+        )
+    return {"auth": BouncerTokenVerifier(identity_resolver)}
 
 
 def run_http(gate: FastMCPProxy, *, host: str, port: int) -> None:
