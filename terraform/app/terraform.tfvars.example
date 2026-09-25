@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars and fill in your own values.
+# terraform.tfvars is gitignored: it describes your account, not the project.
+
+# Must match the region the bootstrap ECR repository and ACM certificate live in.
+aws_region = "eu-west-1"
+
+# The delegated zone from the bootstrap stack. The service is served at this
+# exact name (the zone apex). Supply your own; nothing here is hardcoded (R3).
+dns_zone_name = "bouncer.example.com"
+
+# Receives the fail_closed alarm. AWS emails a confirmation link you must click.
+alert_email = "you@example.com"
+
+# Optional.
+#
+# Source IPs allowed to reach the ALB. Leave unset (or null) to allow only the
+# public IP of the machine you apply from, discovered at apply time.
+# allowed_cidrs = ["203.0.113.4/32", "198.51.100.0/24"]
+#
+# project_name       = "mcp-bouncer"   # must match the bootstrap stack
+# image_tag          = "latest"
+# vpc_cidr           = "10.0.0.0/16"
+# log_retention_days = 30
+# cpu_architecture   = "X86_64"        # or "ARM64"
+#
+# One bearer token is generated per entry. Every team must exist in policy.yaml.
+# callers = {
+#   "customerchat-agent" = "CustomerChat"
+#   "devchat-agent"      = "DevChat"
+# }
+#
+# tags = { Owner = "you" }
