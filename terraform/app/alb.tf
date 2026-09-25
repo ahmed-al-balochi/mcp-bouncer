@@ -25,7 +25,7 @@ resource "aws_lb_target_group" "this" {
   vpc_id      = aws_vpc.this.id
 
   # Probe the unauthenticated /health route (R31, NOTES): GET, expect 200. MCP
-  # traffic is on /mcp/, never health-checked.
+  # traffic is on /mcp, never health-checked.
   health_check {
     path                = "/health"
     protocol            = "HTTP"

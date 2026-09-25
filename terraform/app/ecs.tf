@@ -38,6 +38,9 @@ resource "aws_ecs_task_definition" "this" {
   # equivalent -- deferred, not solved here.
   volume {
     name = "tmp"
+    # Written out because AWS stores it; omitting it made every plan replace the
+    # task definition (DECISIONS D4.14).
+    configure_at_launch = false
   }
 
   container_definitions = jsonencode([
@@ -67,7 +70,10 @@ resource "aws_ecs_task_definition" "this" {
       portMappings = [
         {
           containerPort = local.container_port
-          protocol      = "tcp"
+          # awsvpc requires hostPort == containerPort; AWS fills it in if
+          # omitted, which Terraform then sees as drift (D4.14).
+          hostPort = local.container_port
+          protocol = "tcp"
         }
       ]
 
@@ -80,6 +86,7 @@ resource "aws_ecs_task_definition" "this" {
         # none of them. Fargate accepts dropping ALL (it rejects ADDs of most
         # capabilities, but a drop is always honoured).
         capabilities = {
+          add  = []
           drop = ["ALL"]
         }
       }
@@ -107,10 +114,24 @@ resource "aws_ecs_task_definition" "this" {
         { name = "AWS_REGION", value = var.aws_region },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         { name = "BOUNCER_LOG_LEVEL", value = "INFO" },
+        # Trust X-Forwarded-Proto ONLY from the ALB's own subnets. TLS ends at
+        # the ALB, so without this uvicorn sees plain HTTP and any redirect it
+        # issues -- e.g. Starlette's `/mcp/` -> `/mcp` -- points at http://,
+        # which makes a following client re-send the request body in cleartext
+        # (DECISIONS D4.16). uvicorn reads this variable when its config leaves
+        # forwarded_allow_ips unset (verified in uvicorn 0.53.0). Scoped to the
+        # public subnet CIDRs rather than "*" so the trust does not rest on the
+        # task security group alone.
+        { name = "FORWARDED_ALLOW_IPS", value = join(",", local.public_subnet_cidrs) },
         # No BOUNCER_POLICY: the image's WORKDIR is /app and policy.yaml is at
         # /app/policy.yaml, so the registry's default path (cwd/policy.yaml)
         # already resolves it (verified in gate/registry.py default_policy_path).
       ]
+
+      # Empty lists AWS adds on storage; declared so the plan shows no drift
+      # (D4.14).
+      systemControls = []
+      volumesFrom    = []
 
       logConfiguration = {
         logDriver = "awslogs"

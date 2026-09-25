@@ -8,6 +8,18 @@
 # account's principals), so the endpoint is a second enforcement layer that
 # intersects with the IAM policies in iam.tf.
 #
+# Role scoping is expressed as `Principal "*"` plus an `aws:PrincipalArn`
+# condition, NOT as the role ARN in `Principal`. The two scope identically: for
+# an assumed-role session aws:PrincipalArn is the ROLE's ARN, and if the key is
+# absent the Allow simply does not apply. The difference is WHEN it is checked.
+# A role ARN in `Principal` is resolved when the endpoint is created, and a role
+# created seconds earlier in the same apply may not have propagated yet -- the
+# first apply of this stack failed all four interface endpoints with
+# `InvalidPolicyDocument: UnknownError`, and an unchanged retry succeeded
+# (DECISIONS D4.13). A condition value is only compared at request time, so the
+# race cannot occur. The S3 policy is deliberately left without any principal
+# condition (see below).
+#
 # Two gateway endpoints (S3, DynamoDB) attach to the private route table and add
 # the only routes it carries. Four interface endpoints (ECR api/dkr, Logs,
 # Secrets Manager) live in the private subnets with private DNS, guarded by the
@@ -76,7 +88,13 @@ data "aws_iam_policy_document" "dynamodb_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.task.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.task.arn]
     }
   }
 
@@ -88,7 +106,13 @@ data "aws_iam_policy_document" "dynamodb_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.task.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.task.arn]
     }
   }
 }
@@ -117,7 +141,13 @@ data "aws_iam_policy_document" "ecr_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.execution.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.execution.arn]
     }
   }
 
@@ -133,7 +163,13 @@ data "aws_iam_policy_document" "ecr_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.execution.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.execution.arn]
     }
   }
 }
@@ -179,7 +215,13 @@ data "aws_iam_policy_document" "logs_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.execution.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.execution.arn]
     }
   }
 }
@@ -206,7 +248,13 @@ data "aws_iam_policy_document" "secretsmanager_endpoint" {
 
     principals {
       type        = "AWS"
-      identifiers = [aws_iam_role.task.arn]
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.task.arn]
     }
   }
 }

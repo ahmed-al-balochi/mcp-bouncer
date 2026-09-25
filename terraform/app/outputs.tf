@@ -3,8 +3,9 @@
 # with the emitted get-secret-value command, never printed here (R19).
 
 output "service_url" {
+  # No trailing slash: `/mcp/` is answered with a redirect to `/mcp` (D4.16).
   description = "The MCP endpoint. Point an MCP client with a bearer token here."
-  value       = "https://${local.service_host}/mcp/"
+  value       = "https://${local.service_host}/mcp"
 }
 
 output "health_url" {

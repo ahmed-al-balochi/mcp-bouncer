@@ -18,6 +18,7 @@ env var and every listener is on loopback (R45).
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import socket
 import threading
@@ -324,3 +325,75 @@ def test_no_unauthenticated_well_known_route_is_registered(asgi_app: Any):
     with TestClient(asgi_app) as client:
         response = client.get("/.well-known/oauth-protected-resource")
     assert response.status_code == 404
+
+
+def _start_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path, trusted: str
+) -> int:
+    """Serve the gate through `run_http` with a given proxy-trust setting."""
+    monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
+    # uvicorn reads this when the config leaves forwarded_allow_ips unset, which
+    # is exactly how the deployed task configures trust of the ALB.
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", trusted)
+    port = _free_port()
+    gate = build_gate(
+        build_server(),
+        policy_path=policy_path,
+        db_path=tmp_path / "proxy.db",
+        transport="http",
+    )
+    threading.Thread(
+        target=lambda: run_http(gate, host="127.0.0.1", port=port), daemon=True
+    ).start()
+    _await_listening("127.0.0.1", port)
+    time.sleep(1.0)
+    return port
+
+
+def _slash_redirect_location(port: int) -> str:
+    """POST to `/mcp/` as an ALB would forward it; return the redirect target."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(
+        "POST",
+        "/mcp/",
+        body="{}",
+        headers={
+            "Host": "gate.example.test",
+            "X-Forwarded-Proto": "https",
+            "Content-Type": "application/json",
+        },
+    )
+    response = conn.getresponse()
+    location = response.getheader("location", "")
+    conn.close()
+    assert response.status == 307
+    return location
+
+
+def test_a_redirect_behind_a_trusted_proxy_keeps_https(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
+) -> None:
+    """Behind the ALB, a redirect must not downgrade the client to plain HTTP.
+
+    TLS ends at the load balancer, so the gate sees HTTP. If it ignored the
+    ALB's X-Forwarded-Proto, Starlette's `/mcp/` -> `/mcp` redirect would point
+    at http://, and a client that follows it re-sends the request body in
+    cleartext. This pins that `run_http` leaves uvicorn's proxy-header handling
+    on, so trusting the proxy (FORWARDED_ALLOW_IPS) is enough.
+    """
+    port = _start_listener(monkeypatch, tmp_path, policy_path, trusted="127.0.0.1")
+    assert _slash_redirect_location(port).startswith("https://gate.example.test/")
+
+
+def test_an_untrusted_forwarded_proto_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
+) -> None:
+    """The header is honoured only from the trusted network, never from anyone.
+
+    With the listener trusting a network the request does not come from, the
+    same forged X-Forwarded-Proto has no effect. This is what scoping the trust
+    to the ALB's subnets buys, and it proves the previous test passes because of
+    the trust setting rather than unconditionally.
+    """
+    port = _start_listener(monkeypatch, tmp_path, policy_path, trusted="10.99.0.0/24")
+    assert _slash_redirect_location(port).startswith("http://gate.example.test/")
