@@ -182,16 +182,20 @@ def test_run_http_suppresses_everything_that_would_pollute_the_log_stream(
     announce the server.
 
     Asserting on what `run_http` passes, rather than on the constant, because the
-    defect this guards against is a caller that reaches for `gate.run` directly
-    and silently gets uvicorn's defaults back. Captured by substituting run.
+    defect this guards against is a caller that reaches for the raw fastmcp run
+    entry point directly and silently gets uvicorn's defaults back. `run_http`
+    now warms the upstream and serves in one event loop (bug D5.3/D5.8), so it
+    drives `run_http_async`; the fake captures that call. `warm_up=False` is
+    passed so the fake needs no real upstream -- the header suppression this test
+    guards is independent of the warm-up.
     """
     captured: dict[str, Any] = {}
 
     class _FakeGate:
-        def run(self, **kwargs: Any) -> None:
+        async def run_http_async(self, **kwargs: Any) -> None:
             captured.update(kwargs)
 
-    run_http(_FakeGate(), host="127.0.0.1", port=1234)  # type: ignore[arg-type]
+    run_http(_FakeGate(), host="127.0.0.1", port=1234, warm_up=False)  # type: ignore[arg-type]
 
     assert captured["transport"] == "http"
     assert captured["host"] == "127.0.0.1"

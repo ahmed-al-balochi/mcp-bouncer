@@ -19,8 +19,10 @@ the boot, exactly as a bad policy does (R17).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -55,6 +57,40 @@ from gate.storage import (
 # `http` crosses a network boundary and demands a bearer token.
 STDIO_TRANSPORT = "stdio"
 HTTP_TRANSPORT = "http"
+
+# The era pinned onto EVERY backend connection the proxy opens (bug D5.3/D5.8).
+#
+# Root cause this fixes: for a script-path (stdio) upstream, fastmcp keeps ONE
+# shared StdioTransport (keep_alive=True) spawned lazily on the first request.
+# With no explicit mode, create_proxy MIRRORS the front's negotiated era onto
+# the backend per request (proxy.py `_mirror_front_era_mode`). A cold child that
+# takes longer than the client's DISCOVER_TIMEOUT_SECONDS (10 s) makes an
+# auto-mode front time out its modern `server/discover` probe and fall back to
+# the legacy `initialize` handshake -- so the timed-out modern attempt and the
+# legacy fallback ask that one shared transport for DIFFERENT TransportOptions,
+# and StdioTransport.connect raises "This stdio transport has a live session
+# built for different connection options...". Pinning an explicit mode takes the
+# mirroring path out of play (proxy.py `_create_client_factory`, explicit_mode
+# branch): every backend connection -- and the boot warm-up -- uses identical
+# options regardless of the front era, so no two connections can disagree.
+#
+# Value chosen EMPIRICALLY (see tests/test_cold_upstream.py).
+# The required property is that ONE pinned era serves BOTH a front in
+# mode="legacy" and a front in the default mode="auto" (modern), for
+# read/write/destructive/park/approve/deny on a cold stdio upstream. Measured
+# against the real HTTP listener + the slow stdio child, all three candidates --
+# "legacy", the newest modern protocol version, and "auto" -- fix the
+# collision and pass every flow for both fronts (the demo upstream uses none of
+# the modern-only round-trips like elicitation / sampling / guard tools, so a
+# legacy front proxied to a modern backend still works). "legacy" is chosen on a
+# robustness tiebreak grounded in the mechanism: it drives the plain
+# `initialize` handshake and performs NO backend `server/discover` probe, so it
+# is the one candidate that cannot itself become timeout-sensitive on a cold
+# child -- pinning "auto" or a modern version would have the BACKEND re-probe
+# discover on connect, reintroducing the exact timeout class this bug is about.
+# It also interoperates with any MCP server, since a modern server still accepts
+# the legacy handshake.
+BACKEND_PROXY_MODE = "legacy"
 
 # The ALB target group probes this path. It is a SEPARATE Starlette route from
 # the MCP endpoint (see `_install_health_route`), so it is never dispatched
@@ -138,6 +174,7 @@ def build_gate(
     team: str | None = None,
     transport: str = STDIO_TRANSPORT,
     name: str = "mcp-bouncer",
+    proxy_mode: str | None = BACKEND_PROXY_MODE,
 ) -> FastMCPProxy:
     """Build the gate proxy, or raise and refuse to boot.
 
@@ -151,6 +188,16 @@ def build_gate(
     `transport` selects the identity model, not just how the server listens:
     the in-memory tests and stdio both trust `--caller`; `http` builds a
     bearer-token resolver and rejects unauthenticated calls (R18).
+
+    `proxy_mode` PINS the backend protocol era for every upstream connection
+    (bug D5.3/D5.8; see `BACKEND_PROXY_MODE`). It defaults to the pinned value
+    and is a parameter only so the regression test can drive the exact
+    mirroring collision by passing `proxy_mode=None` (the pre-fix behaviour) --
+    production never overrides it. It is applied for EVERY upstream kind (stdio,
+    http, in-memory) so there is no deployed-only code path (R35). An in-process
+    FastMCP upstream is passed straight through by create_proxy without a stdio
+    transport, so the pin cannot collide there; it is still applied uniformly so
+    the tests and the deployed path run the same construction.
 
     The stores come from the factory, not from a concrete class, so the same
     binary runs on a local SQLite file or on DynamoDB purely according to
@@ -168,7 +215,9 @@ def build_gate(
     )
     audit = build_audit_log(db_path=db_path)
 
-    proxy = create_proxy(upstream, name=name, **_http_auth(transport, identity_resolver))
+    proxy = create_proxy(
+        upstream, name=name, mode=proxy_mode, **_http_auth(transport, identity_resolver)
+    )
     proxy.add_middleware(GateMiddleware(registry, approvals, audit, identity_resolver))
     _install_health_route(proxy)
     return proxy
@@ -210,7 +259,7 @@ def _http_auth(transport: str, identity_resolver: IdentityResolver) -> dict[str,
     return {"auth": BouncerTokenVerifier(identity_resolver)}
 
 
-def run_http(gate: FastMCPProxy, *, host: str, port: int) -> None:
+def run_http(gate: FastMCPProxy, *, host: str, port: int, warm_up: bool = True) -> None:
     """Serve the gate over HTTP, with the response headers a public endpoint needs.
 
     This exists as a named function rather than an inline `gate.run(...)` so the
@@ -230,14 +279,101 @@ def run_http(gate: FastMCPProxy, *, host: str, port: int) -> None:
     same stdout stream that is supposed to be JSON per line (R33). It is set here
     rather than only via the environment so the production path is correct however
     the gate is launched.
+
+    Warm-up (bug D5.3/D5.8, Part 1) runs in the SAME event loop that serves, not
+    in a throwaway one. That ordering is not cosmetic: fastmcp's kept-alive
+    stdio session binds its background connect task to the loop it was created
+    on, so warming in a separate `asyncio.run` (which closes its loop) would
+    leave the shared transport bound to a dead loop and the first real request
+    would raise "Event loop is closed" -- verified. So `run_http` opens ONE loop,
+    awaits the warm-up (which spawns the child and establishes the shared
+    session under the pinned era), and only then starts uvicorn. Because uvicorn
+    -- and therefore the `/health` route -- does not exist until after the
+    warm-up returns, an ALB probe cannot receive a 200 before the upstream is
+    warm: there is no healthy-but-cold window. `warm_up=False` is a TEST SEAM to
+    observe the pre-fix cold-first-request behaviour; production never sets it.
     """
-    gate.run(
-        transport="http",
-        host=host,
-        port=port,
-        show_banner=False,
-        uvicorn_config=dict(UVICORN_CONFIG),
-    )
+
+    async def _serve() -> None:
+        if warm_up:
+            await warm_up_upstream(gate)
+        await gate.run_http_async(
+            transport="http",
+            host=host,
+            port=port,
+            show_banner=False,
+            uvicorn_config=dict(UVICORN_CONFIG),
+        )
+
+    asyncio.run(_serve())
+
+
+class UpstreamUnavailableError(RuntimeError):
+    """The upstream could not be reached during the boot warm-up.
+
+    Raised so the gate REFUSES TO BOOT rather than starting to serve and failing
+    on the first request (R17/R13, in the spirit of the policy/identity refuse-
+    to-boot checks). The message names the underlying failure so an operator can
+    act on it -- a bad `--upstream` script path is the common case.
+    """
+
+
+async def warm_up_upstream(gate: FastMCPProxy) -> None:
+    """Open one upstream connection at boot and list its tools, or refuse to boot.
+
+    Async ON PURPOSE: it must run in the SAME event loop that will serve, because
+    fastmcp's kept-alive stdio session is bound to the loop it is created on (see
+    `run_http`). A synchronous wrapper that used its own `asyncio.run` would
+    close that loop and the shared session with it.
+
+    Why this runs before serving (bug D5.3/D5.8, Part 1):
+
+        For a script-path upstream, fastmcp spawns ONE shared stdio child LAZILY
+        on the first request and keeps it alive. On a cold 0.25 vCPU task that
+        first spawn can take longer than the client's 10 s discover timeout, and
+        a slow spawn is the trigger for the era collision (see
+        `BACKEND_PROXY_MODE`) as well as a slow first call for whoever hits it.
+        Warming the child here moves that cost to boot -- before any client is
+        served -- so the first real request meets an already-running child.
+
+    Why it goes through the proxy's OWN `client_factory`:
+
+        The factory is what every real request uses, so the warm-up connection
+        adopts the SAME pinned `BACKEND_PROXY_MODE` and the SAME transport
+        options. Warming through a hand-built client with different options would
+        itself create the mismatch this fix exists to prevent. Because the pin is
+        explicit, `_mirror_front_era_mode` is not consulted, so the absence of a
+        front request context here does not matter.
+
+    Why it refuses to boot on failure:
+
+        An unreachable upstream (e.g. a script that cannot serve MCP) means the
+        gate can never serve a single call. Discovering that at boot and
+        refusing, with an actionable message, is the same posture the gate
+        already takes on a bad policy or an unusable token source (R17) -- fail
+        before serving, never serve-then-fail (R13).
+
+    Emits exactly one `upstream_ready` log line carrying the warm-up duration in
+    milliseconds (the operator's measurement of the real cold-spawn time) and the
+    advertised tool count. No tool names, arguments or secrets are logged (R33).
+    """
+    started = time.monotonic()
+    try:
+        # `client_factory` is set by FastMCPProxy.__init__; every proxied request
+        # builds its client this way, so the warm-up shares the pinned era.
+        client = gate.client_factory()
+        async with client:
+            tools = await client.list_tools()
+        tool_count = len(tools)
+    except Exception as error:
+        # Refuse to boot: surface WHAT failed so the operator can fix it. The
+        # message is the exception's own text (a connection or spawn failure),
+        # never a token or an argument -- none reach this path.
+        raise UpstreamUnavailableError(
+            f"upstream warm-up failed; refusing to boot: {error}"
+        ) from error
+    duration_ms = int((time.monotonic() - started) * 1000)
+    observability.log_upstream_ready(duration_ms=duration_ms, tool_count=tool_count)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -307,8 +443,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the argument parser holds as a secret.
     observability.log_boot(_redacted_boot_config(arguments))
 
+    # Warm the upstream BEFORE serving, on BOTH transports (bug D5.3/D5.8,
+    # Part 1). Warming spawns the kept-alive stdio child and establishes the
+    # shared session while nothing is being served, so the first real request
+    # does not pay the cold-spawn latency that triggers the era collision. It
+    # raises `UpstreamUnavailableError` if the upstream cannot be reached, so an
+    # unusable `--upstream` refuses to boot here rather than failing later.
+    #
+    # It MUST share the serving event loop (the kept-alive session is bound to
+    # the loop it is created on), so HTTP goes through `run_http` -- which warms
+    # then serves in one loop -- and stdio warms then serves in one loop here.
+    #
+    # ALB health semantics: over HTTP the warm-up completes before uvicorn (and
+    # thus the `/health` route) exists, so an ALB probe cannot see a 200 while
+    # the upstream is still cold. Over stdio there is no HTTP listener at all.
     if arguments.transport == STDIO_TRANSPORT:
-        gate.run(transport="stdio")
+
+        async def _serve_stdio() -> None:
+            await warm_up_upstream(gate)
+            await gate.run_stdio_async(show_banner=False)
+
+        asyncio.run(_serve_stdio())
     else:
         run_http(gate, host=arguments.host, port=arguments.port)
     return 0

@@ -222,6 +222,23 @@ def log_auth_rejected(*, reason: str, tool: str) -> None:
     _emit(logging.WARNING, "auth_rejected", reason=reason, tool=tool)
 
 
+def log_upstream_ready(*, duration_ms: int, tool_count: int) -> None:
+    """Record that the upstream was warmed up at boot before serving (bug D5.3).
+
+    Emitted once per task start, after `build_gate` opens one connection to the
+    upstream through the proxy's own client factory and lists its tools, so the
+    kept-alive stdio child is already spawned before the first real request.
+    `duration_ms` is how long that warm-up took: on 0.25 vCPU Fargate this is the
+    operator's only measurement of the real cold-spawn time -- the very latency
+    that, when it exceeds the client's 10 s discover timeout, produced the era
+    collision. `tool_count` is a plain integer (how many tools the upstream
+    advertised), never a tool name or argument, so no catalogue detail leaks
+    (R33). No arguments and no secrets pass through this helper -- it has no
+    parameter that could carry one.
+    """
+    _emit(logging.INFO, "upstream_ready", duration_ms=duration_ms, tool_count=tool_count)
+
+
 def log_fail_closed(*, caller: str, tool: str) -> None:
     """Record a fail-closed block: an internal error denied a call (R13).
 
