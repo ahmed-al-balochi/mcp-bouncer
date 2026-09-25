@@ -105,11 +105,31 @@ def _approve(approvals: ApprovalStore, approval_id: str, ttl_minutes: int) -> in
     if granted is None:
         print(f"bouncer: no parked call with id {approval_id}")
         return 1
+    # Print the grant's REAL lifetime, taken from the approval the store just
+    # wrote, not the baseline the CLI was constructed with. The gate stamped the
+    # caller's effective (possibly team-tightened) TTL on the parked call, so a
+    # CustomerChat grant reads 5 minutes here even though this CLI never knew the
+    # caller's team (R26, bug D5.2). A row without a stamped TTL falls back to
+    # the store default, which is exactly the baseline `ttl_minutes` argument.
+    lifetime_minutes = (
+        granted.ttl_seconds / 60.0 if granted.ttl_seconds is not None else ttl_minutes
+    )
     print(
         f"approved {approval_id}: {granted.tool} for {granted.caller}."
-        f" Valid for one retry of {granted.arguments} within {ttl_minutes} minutes."
+        f" Valid for one retry of {granted.arguments} within"
+        f" {_format_minutes(lifetime_minutes)} minutes."
     )
     return 0
+
+
+def _format_minutes(minutes: float) -> str:
+    """Render a minute count without a trailing `.0` for whole values.
+
+    Grant lifetimes are whole minutes in practice (policy states them in
+    minutes), so `5` reads better than `5.0`; a fractional value still prints
+    honestly rather than being rounded away.
+    """
+    return str(int(minutes)) if float(minutes).is_integer() else f"{minutes:g}"
 
 
 def _deny(approvals: ApprovalStore, approval_id: str) -> int:

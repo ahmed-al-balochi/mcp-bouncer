@@ -47,8 +47,25 @@ class ApprovalStore(Protocol):
     def ttl_seconds(self) -> float: ...
 
     def create(
-        self, caller: str, tool: str, arguments: Mapping[str, Any]
+        self,
+        caller: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        *,
+        ttl_seconds: float | None = None,
     ) -> PendingApproval: ...
+    # R26 interface change (owner-approved, DECISIONS D5.5). `create` gains a
+    # per-approval `ttl_seconds` so the gate can stamp the CALLER'S effective TTL
+    # -- a team may have tightened it below the baseline (R23) -- on the parked
+    # call at park time. `approve` then computes the grant's expiry from that
+    # stored value, and `expire` honours it, instead of every grant living the
+    # single store-wide default. Before this, the store was constructed once with
+    # the baseline TTL and whichever process ran `approve` (usually the operator
+    # CLI, which does not know the caller's team) wrote the expiry, so a team's
+    # tightened TTL was advertised in the gate's message but never enforced on
+    # the stored grant (bug D5.2). `None` means "use the store default", which
+    # remains the baseline: existing callers keep working and a stamped TTL is
+    # never looser than the baseline because a team override may only shorten it.
 
     def approve(self, approval_id: str) -> PendingApproval | None: ...
 

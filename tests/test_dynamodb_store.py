@@ -214,3 +214,31 @@ def test_window_query_is_correct_across_the_hour_boundary(
     # Another half hour: both releases are now older than an hour.
     clock.advance(1800)
     assert store.approved_in_window(CALLER) == 0
+
+
+def test_native_ttl_attribute_matches_the_per_row_expiry(
+    make_store: Callable[..., Any], dynamodb_client: Any
+):
+    """R26 / D5.2: the grant's native `ttl` is computed from the per-row TTL.
+
+    Park with a 5-minute TTL against a store whose default is 10 minutes, approve,
+    then read the grant item straight from the table. Both `expires_at` and the
+    native `ttl` attribute must sit at approve-time + 5 minutes, not + 10. On the
+    unfixed code both were written from the 10-minute store default.
+    """
+    clock = _Clock()
+    store = make_store(clock=clock)
+    parked = store.create(CALLER, TOOL, PAGE_7, ttl_seconds=5 * 60.0)
+    approve_time = clock.now
+    store.approve(parked.id)
+
+    from gate.approvals import args_hash
+
+    digest = args_hash(CALLER, TOOL, PAGE_7)
+    table = store._provisioning_table  # noqa: SLF001
+    item = dynamodb_client.get_item(
+        TableName=table, Key={"PK": {"S": f"GRANT#{digest}"}, "SK": {"S": "GRANT"}}
+    )["Item"]
+
+    assert float(item["expires_at"]["N"]) == approve_time + 5 * 60.0
+    assert int(item["ttl"]["N"]) == int(approve_time + 5 * 60.0)

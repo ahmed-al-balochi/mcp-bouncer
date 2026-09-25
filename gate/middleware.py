@@ -128,7 +128,19 @@ class GateMiddleware(Middleware):
                     classification, caller, replace(state, grant_available=True), limits
                 )
             else:
-                approval_id = self._approvals.create(caller, tool, arguments).id
+                # Stamp the CALLER'S effective TTL on the parked call. `limits`
+                # is the team's already-tightened view, so a team that shortened
+                # approval_ttl_minutes (CustomerChat: 5) gets a grant that
+                # actually lives 5 minutes, not the store's baseline 10 -- the
+                # gate is the only component that authoritatively knows the team
+                # at park time (R26, R23, bug D5.2). Seconds, because the store
+                # works in seconds.
+                approval_id = self._approvals.create(
+                    caller,
+                    tool,
+                    arguments,
+                    ttl_seconds=limits.approval_ttl_minutes * 60.0,
+                ).id
 
         self._audit.record(
             caller, tool, classification, decision, args_hash(caller, tool, arguments)
