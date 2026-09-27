@@ -2,19 +2,18 @@
 # plain text: the tokens live only in the secret and in state, and are fetched
 # with the emitted get-secret-value command, never printed here (R19).
 
-output "service_url" {
-  # No trailing slash: `/mcp/` is answered with a redirect to `/mcp` (D4.16).
-  description = "The MCP endpoint. Point an MCP client with a bearer token here."
-  value       = "https://${local.service_host}/mcp"
+output "gateway_url" {
+  description = "The public HTTPS base for the LiteLLM gateway (the only host the ALB serves)."
+  value       = "https://${local.gateway_host}"
 }
 
-output "health_url" {
-  description = "Unauthenticated ALB health endpoint. A 200 means the task is serving."
-  value       = "https://${local.service_host}/health"
+output "gateway_openai_base_url" {
+  description = "OpenAI-compatible base URL for agents: point an OpenAI client's base_url here (it appends /chat/completions and /models, the only paths the ALB forwards)."
+  value       = "https://${local.gateway_host}/v1"
 }
 
 output "alb_dns_name" {
-  description = "The ALB's own DNS name, useful for debugging before the apex record propagates."
+  description = "The ALB's own DNS name, useful for debugging before the gateway record propagates. Note the ALB answers only the gateway host, so a request to this name returns 404."
   value       = aws_lb.this.dns_name
 }
 
@@ -31,6 +30,38 @@ output "audit_table_name" {
 output "log_group_name" {
   description = "CloudWatch log group carrying the gate's JSON logs and the fail_closed signal."
   value       = aws_cloudwatch_log_group.task.name
+}
+
+output "litellm_log_group_name" {
+  description = "CloudWatch log group carrying the LiteLLM gateway's JSON logs (prompts/responses not logged)."
+  value       = aws_cloudwatch_log_group.litellm.name
+}
+
+output "litellm_master_key_get_command" {
+  description = <<-EOT
+    Fetch the generated LiteLLM master key from Secrets Manager. Run this rather
+    than exposing the key as a Terraform output (it is LiteLLM's admin key). It
+    is the Authorization: Bearer value an agent uses for model calls.
+  EOT
+  value       = "aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.litellm_master_key.arn} --query SecretString --output text"
+}
+
+output "agent_mcp_tool_shape" {
+  description = <<-EOT
+    Shape of the MCP tool block an agent sends to the gateway on
+    /v1/chat/completions. The agent forwards its OWN gate token in the header;
+    fetch a gate token with tokens_get_command. Model calls use the master key
+    (litellm_master_key_get_command) as the request Authorization header.
+      server_label: bouncer
+      server_url:   litellm_proxy/mcp/bouncer
+      header:       x-mcp-bouncer-authorization: Bearer <gate token>
+  EOT
+  value = {
+    server_label = "bouncer"
+    server_url   = "litellm_proxy/mcp/bouncer"
+    header_name  = "x-mcp-bouncer-authorization"
+    header_value = "Bearer <gate token>"
+  }
 }
 
 output "tokens_secret_arn" {

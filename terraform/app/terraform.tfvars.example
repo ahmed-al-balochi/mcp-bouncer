@@ -4,8 +4,9 @@
 # Must match the region the bootstrap ECR repository and ACM certificate live in.
 aws_region = "eu-west-1"
 
-# The delegated zone from the bootstrap stack. The service is served at this
-# exact name (the zone apex). Supply your own; nothing here is hardcoded (R3).
+# The delegated zone from the bootstrap stack. The gateway is served at
+# <gateway_host_label>.<this zone> (default llm.<zone>); the apex serves nothing.
+# Supply your own; nothing here is hardcoded (R3).
 dns_zone_name = "bouncer.example.com"
 
 # Receives the fail_closed alarm. AWS emails a confirmation link you must click.
@@ -19,9 +20,14 @@ alert_email = "you@example.com"
 #
 # project_name       = "mcp-bouncer"   # must match the bootstrap stack
 # image_tag          = "latest"
+# litellm_image_tag  = "latest"         # tag of the thin LiteLLM gateway image
 # vpc_cidr           = "10.0.0.0/16"
 # log_retention_days = 30
 # cpu_architecture   = "X86_64"        # or "ARM64"
+#
+# Gateway hostname and model routing (project design; defaults are usually fine).
+# gateway_host_label           = "llm"                       # gateway served at llm.<dns_zone_name>
+# bedrock_inference_profile_id = "eu.anthropic.claude-sonnet-5"  # must start with "eu." (EU-only)
 #
 # One bearer token is generated per entry. Every team must exist in policy.yaml.
 # callers = {

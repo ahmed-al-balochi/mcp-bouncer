@@ -147,7 +147,7 @@ data "aws_iam_policy_document" "ecr_endpoint" {
     condition {
       test     = "StringEquals"
       variable = "aws:PrincipalArn"
-      values   = [aws_iam_role.execution.arn]
+      values   = [aws_iam_role.execution.arn, aws_iam_role.litellm_execution.arn]
     }
   }
 
@@ -159,7 +159,10 @@ data "aws_iam_policy_document" "ecr_endpoint" {
       "ecr:GetDownloadUrlForLayer",
       "ecr:BatchCheckLayerAvailability",
     ]
-    resources = [data.aws_ecr_repository.this.arn]
+    # Each execution role pulls only its own repository; both repositories are
+    # listed here and IAM (iam.tf) restricts each role to one, so the endpoint
+    # policy and IAM intersect to the correct pairing.
+    resources = [data.aws_ecr_repository.this.arn, data.aws_ecr_repository.litellm.arn]
 
     principals {
       type        = "AWS"
@@ -169,7 +172,7 @@ data "aws_iam_policy_document" "ecr_endpoint" {
     condition {
       test     = "StringEquals"
       variable = "aws:PrincipalArn"
-      values   = [aws_iam_role.execution.arn]
+      values   = [aws_iam_role.execution.arn, aws_iam_role.litellm_execution.arn]
     }
   }
 }
@@ -198,8 +201,8 @@ resource "aws_vpc_endpoint" "ecr_dkr" {
   tags = { Name = "${var.project_name}-ecr-dkr" }
 }
 
-# Logs: CreateLogStream/PutLogEvents on our log group and its streams, execution
-# role only.
+# Logs: CreateLogStream/PutLogEvents on the gate, LiteLLM and Service Connect log
+# groups and their streams, both execution roles only.
 data "aws_iam_policy_document" "logs_endpoint" {
   statement {
     sid    = "LogsWrite"
@@ -211,6 +214,10 @@ data "aws_iam_policy_document" "logs_endpoint" {
     resources = [
       aws_cloudwatch_log_group.task.arn,
       "${aws_cloudwatch_log_group.task.arn}:*",
+      aws_cloudwatch_log_group.litellm.arn,
+      "${aws_cloudwatch_log_group.litellm.arn}:*",
+      aws_cloudwatch_log_group.serviceconnect.arn,
+      "${aws_cloudwatch_log_group.serviceconnect.arn}:*",
     ]
 
     principals {
@@ -221,7 +228,7 @@ data "aws_iam_policy_document" "logs_endpoint" {
     condition {
       test     = "StringEquals"
       variable = "aws:PrincipalArn"
-      values   = [aws_iam_role.execution.arn]
+      values   = [aws_iam_role.execution.arn, aws_iam_role.litellm_execution.arn]
     }
   }
 }
@@ -238,7 +245,9 @@ resource "aws_vpc_endpoint" "logs" {
   tags = { Name = "${var.project_name}-logs" }
 }
 
-# Secrets Manager: GetSecretValue on exactly the token secret, task role only.
+# Secrets Manager: GetSecretValue on exactly the token secret (gate task role)
+# and exactly the master-key secret (LiteLLM execution role). Two statements so
+# each principal reaches only its own secret; the gate's statement is unchanged.
 data "aws_iam_policy_document" "secretsmanager_endpoint" {
   statement {
     sid       = "TokenSecretRead"
@@ -257,6 +266,24 @@ data "aws_iam_policy_document" "secretsmanager_endpoint" {
       values   = [aws_iam_role.task.arn]
     }
   }
+
+  statement {
+    sid       = "MasterKeyRead"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.litellm_master_key.arn]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.litellm_execution.arn]
+    }
+  }
 }
 
 resource "aws_vpc_endpoint" "secretsmanager" {
@@ -269,4 +296,51 @@ resource "aws_vpc_endpoint" "secretsmanager" {
   policy              = data.aws_iam_policy_document.secretsmanager_endpoint.json
 
   tags = { Name = "${var.project_name}-secretsmanager" }
+}
+
+# --- bedrock-runtime interface endpoint (R53 layer 3, R57, D6.10) ----------
+#
+# The third EU-only layer: even the network path to Bedrock is resource-scoped
+# to the EU profile ARN and the EU foundation-model ARNs it routes to, and to
+# the LiteLLM task role as principal. So a request for any other model, or from
+# any other principal, has no route out -- InvokeModel on a non-EU model is
+# refused at the endpoint as well as in IAM (iam.tf) and at LiteLLM's model list
+# (layer 1). The action/resource set matches the IAM policy exactly; the
+# foundation-model resources sit in the same statement as the profile because a
+# VPC endpoint policy has no bedrock:InferenceProfileArn analogue to condition
+# on -- the IAM layer carries that constraint, and the endpoint simply bounds the
+# reachable ARNs to the EU set.
+data "aws_iam_policy_document" "bedrock_endpoint" {
+  statement {
+    sid    = "InvokeEuModelsOnly"
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
+    resources = concat([local.bedrock_profile_arn], local.bedrock_model_arns)
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.litellm_task.arn]
+    }
+  }
+}
+
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.aws_region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [for s in aws_subnet.private : s.id]
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true
+  policy              = data.aws_iam_policy_document.bedrock_endpoint.json
+
+  tags = { Name = "${var.project_name}-bedrock-runtime" }
 }

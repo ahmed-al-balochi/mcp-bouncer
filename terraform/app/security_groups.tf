@@ -42,15 +42,16 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http_redirect" {
   to_port           = 80
 }
 
-# The ALB only ever forwards to the task container port; it needs no other
-# egress. Scoped to the task SG, not the whole VPC.
-resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
+# The ALB only ever forwards to the LiteLLM gateway; the gate is internal-only
+# now (R52). Scoped to the LiteLLM SG on its port, not the whole VPC and not the
+# gate task SG (the from-ALB path to the gate is gone).
+resource "aws_vpc_security_group_egress_rule" "alb_to_litellm" {
   security_group_id            = aws_security_group.alb.id
-  description                  = "To tasks on the container port"
-  referenced_security_group_id = aws_security_group.task.id
+  description                  = "To the LiteLLM gateway on its container port"
+  referenced_security_group_id = aws_security_group.litellm.id
   ip_protocol                  = "tcp"
-  from_port                    = local.container_port
-  to_port                      = local.container_port
+  from_port                    = local.litellm_port
+  to_port                      = local.litellm_port
 }
 
 # --- task security group ---------------------------------------------------
@@ -67,11 +68,13 @@ resource "aws_security_group" "task" {
   }
 }
 
-# Only the ALB may reach the container port. No other ingress.
-resource "aws_vpc_security_group_ingress_rule" "task_from_alb" {
+# Only the LiteLLM gateway may reach the gate's container port (R52): the gate is
+# internal-only, reachable from the gateway and from nowhere else. The from-ALB
+# ingress is deliberately gone -- the ALB has no path to the gate.
+resource "aws_vpc_security_group_ingress_rule" "task_from_litellm" {
   security_group_id            = aws_security_group.task.id
-  description                  = "From the ALB on the container port"
-  referenced_security_group_id = aws_security_group.alb.id
+  description                  = "From the LiteLLM gateway on the container port"
+  referenced_security_group_id = aws_security_group.litellm.id
   ip_protocol                  = "tcp"
   from_port                    = local.container_port
   to_port                      = local.container_port
@@ -130,4 +133,78 @@ resource "aws_vpc_security_group_ingress_rule" "endpoints_from_tasks" {
   ip_protocol                  = "tcp"
   from_port                    = 443
   to_port                      = 443
+}
+
+# The LiteLLM gateway also reaches the interface endpoints over 443 (ECR/Logs at
+# boot via its execution role, Secrets Manager for the master key, and the
+# bedrock-runtime endpoint for model calls at runtime), so the endpoints SG
+# admits 443 from the LiteLLM SG too (R57).
+resource "aws_vpc_security_group_ingress_rule" "endpoints_from_litellm" {
+  security_group_id            = aws_security_group.endpoints.id
+  description                  = "HTTPS from the LiteLLM gateway"
+  referenced_security_group_id = aws_security_group.litellm.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+}
+
+# --- LiteLLM gateway security group ----------------------------------------
+#
+# The gateway sits between the ALB and both the gate and Bedrock (R51). Ingress:
+# only the ALB, only on 4000. Egress: 443 to the interface endpoints (ECR/Logs/
+# Secrets Manager/bedrock-runtime), 443 to the S3 prefix list (image layers),
+# and 8000 to the gate. No 0.0.0.0/0 (R57): the gateway, like the gate, has no
+# internet path.
+
+resource "aws_security_group" "litellm" {
+  name_prefix = "${var.project_name}-litellm-"
+  description = "LiteLLM gateway: ingress from ALB only, egress to endpoints, S3 layers and the gate only."
+  vpc_id      = aws_vpc.this.id
+
+  tags = { Name = "${var.project_name}-litellm" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Only the ALB may reach the gateway, only on 4000.
+resource "aws_vpc_security_group_ingress_rule" "litellm_from_alb" {
+  security_group_id            = aws_security_group.litellm.id
+  description                  = "From the ALB on the gateway port"
+  referenced_security_group_id = aws_security_group.alb.id
+  ip_protocol                  = "tcp"
+  from_port                    = local.litellm_port
+  to_port                      = local.litellm_port
+}
+
+# 443 to the interface endpoints (ECR api/dkr and Logs at boot, Secrets Manager
+# for the master key, bedrock-runtime for model calls).
+resource "aws_vpc_security_group_egress_rule" "litellm_to_endpoints" {
+  security_group_id            = aws_security_group.litellm.id
+  description                  = "To interface VPC endpoints (ECR, Logs, Secrets Manager, Bedrock)"
+  referenced_security_group_id = aws_security_group.endpoints.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
+}
+
+# 443 to the S3 gateway endpoint for image layers, via its managed prefix list.
+resource "aws_vpc_security_group_egress_rule" "litellm_to_s3" {
+  security_group_id = aws_security_group.litellm.id
+  description       = "To S3 gateway endpoint (image layers) via its prefix list"
+  prefix_list_id    = aws_vpc_endpoint.s3.prefix_list_id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
+# 8000 to the gate: LiteLLM forwards MCP tool calls to the gate's container port.
+resource "aws_vpc_security_group_egress_rule" "litellm_to_gate" {
+  security_group_id            = aws_security_group.litellm.id
+  description                  = "To the gate on its container port (MCP tool calls)"
+  referenced_security_group_id = aws_security_group.task.id
+  ip_protocol                  = "tcp"
+  from_port                    = local.container_port
+  to_port                      = local.container_port
 }

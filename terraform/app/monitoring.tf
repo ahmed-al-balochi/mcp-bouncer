@@ -15,6 +15,25 @@ resource "aws_cloudwatch_log_group" "task" {
   tags = { Name = "${var.project_name}-logs" }
 }
 
+# The LiteLLM gateway's own log group (R56): JSON logs to stdout via awslogs,
+# with prompts/responses NOT logged (turn_off_message_logging in the config).
+resource "aws_cloudwatch_log_group" "litellm" {
+  name              = local.litellm_log_group_name
+  retention_in_days = var.log_retention_days
+
+  tags = { Name = "${var.project_name}-litellm-logs" }
+}
+
+# The Service Connect (Envoy) sidecar log group, shared by both services'
+# sidecars via their log_configuration. Kept separate from the app log groups so
+# the gate's fail_closed metric filter never matches sidecar noise.
+resource "aws_cloudwatch_log_group" "serviceconnect" {
+  name              = local.connect_log_group_name
+  retention_in_days = var.log_retention_days
+
+  tags = { Name = "${var.project_name}-serviceconnect-logs" }
+}
+
 # Metric filter on the JSON `event` field. The gate's log lines are JSON per
 # line, so a JSON pattern matches on the field directly; unparseable library
 # boot lines simply do not match. Namespaced separately from AWS's own metrics.

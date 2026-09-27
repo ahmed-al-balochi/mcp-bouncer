@@ -27,6 +27,16 @@ output "ecr_repository_name" {
   value       = aws_ecr_repository.this.name
 }
 
+output "ecr_litellm_repository_url" {
+  description = "Push the thin LiteLLM gateway image here (G1, D6.10)."
+  value       = aws_ecr_repository.litellm.repository_url
+}
+
+output "ecr_litellm_repository_name" {
+  description = "LiteLLM repository name, looked up by the application stack."
+  value       = aws_ecr_repository.litellm.name
+}
+
 output "certificate_arn" {
   description = <<-EOT
     ARN of the TLS certificate. The application stack looks the certificate up by

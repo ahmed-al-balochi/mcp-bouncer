@@ -75,3 +75,44 @@ resource "aws_secretsmanager_secret_version" "tokens" {
   secret_id     = aws_secretsmanager_secret.tokens.id
   secret_string = jsonencode(local.token_map)
 }
+
+# --- LiteLLM master key (R55, D6.10) ---------------------------------------
+#
+# LiteLLM's master key -- and, without a database, its ONLY key and its ADMIN key
+# (R55, D6.6). Generated here so no human authors it and it never appears in
+# configuration, the image, or the repository; it lives only in local state
+# (gitignored, R40) and in Secrets Manager, and is injected into the container
+# via the `secrets` block as LITELLM_MASTER_KEY.
+#
+# length 48 (>= 40 for entropy) and special = false so the value is header-safe.
+# It is given an `sk-` prefix: LiteLLM matches the master key with an exact
+# secrets.compare_digest (verified: proxy/auth/user_api_key_auth.py:2036), so a
+# non-`sk-` value would still authenticate, but several virtual-key code paths
+# branch on token.startswith("sk-") (e.g. proxy/proxy_server.py:3584), so the
+# `sk-` convention is the safe choice.
+resource "random_password" "litellm_master_key" {
+  length  = 48
+  special = false
+}
+
+resource "aws_secretsmanager_secret" "litellm_master_key" {
+  name        = "${var.project_name}-litellm-master-key"
+  description = "LiteLLM master/admin key for the mcp-bouncer gateway. Generated; never authored."
+
+  # Same disposable-stack reasoning as the token secret: immediate delete on
+  # destroy so a re-apply does not collide on the name (R41).
+  recovery_window_in_days = 0
+
+  # No kms_key_id: the AWS-managed key encrypts it, so the execution role needs
+  # no kms:Decrypt grant.
+
+  tags = { Name = "${var.project_name}-litellm-master-key" }
+}
+
+# A PLAIN STRING, not JSON: the container reads LITELLM_MASTER_KEY as the literal
+# key value, and the ECS `secrets` block injects the whole SecretString as the
+# env var. The `sk-` prefix is prepended here.
+resource "aws_secretsmanager_secret_version" "litellm_master_key" {
+  secret_id     = aws_secretsmanager_secret.litellm_master_key.id
+  secret_string = "sk-${random_password.litellm_master_key.result}"
+}

@@ -86,3 +86,67 @@ resource "aws_ecr_lifecycle_policy" "this" {
     ]
   })
 }
+
+# --- LiteLLM image repository (G1, D6.10) ----------------------------------
+#
+# A SECOND repository, for the thin LiteLLM gateway image, kept separate from
+# the gate's repository on purpose (D6.10): the gateway's execution role can
+# then be scoped to pull only this repository, and the two images never mix
+# under one tag. Additive to this stack -- the existing zone, certificate and
+# gate repository are untouched, so applying this changes nothing that already
+# exists. Every setting mirrors aws_ecr_repository.this so the two repositories
+# are governed identically (MUTABLE tags for tag reuse during a POC,
+# scan_on_push, AES256 at rest, force_delete off, prevent_destroy so a teardown
+# cannot take the image with it).
+resource "aws_ecr_repository" "litellm" {
+  name = "${var.project_name}-litellm"
+
+  image_tag_mutability = "MUTABLE"
+
+  force_delete = false
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# The same lifecycle policy as the gate repository: expire untagged images after
+# a day and keep only the most recent tagged ones, so the repository does not
+# grow without bound across rebuilds.
+resource "aws_ecr_lifecycle_policy" "litellm" {
+  repository = aws_ecr_repository.litellm.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Expire untagged images after one day."
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep only the most recent tagged images."
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = var.image_retention_count
+        }
+        action = { type = "expire" }
+      },
+    ]
+  })
+}

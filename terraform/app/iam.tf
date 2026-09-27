@@ -65,8 +65,15 @@ data "aws_iam_policy_document" "execution" {
     resources = [data.aws_ecr_repository.this.arn]
   }
 
-  # Log stream creation and writes, scoped to this task's log group and its
-  # streams. The group itself is created in monitoring.tf.
+  # Log stream creation and writes, scoped to this task's log group and the
+  # Service Connect sidecar log group, plus their streams. The gate is now a
+  # Service Connect SERVER (ecs.tf), so its task runs an Envoy sidecar whose
+  # awslogs driver uses THIS execution role to create/write streams in the
+  # serviceconnect group (ecs.tf log_configuration -> serviceconnect group).
+  # awslogs stream creation is an execution-role action, and IAM intersects with
+  # the Logs VPC-endpoint policy, so without this group the sidecar's log-stream
+  # creation is denied and the gate task fails to start (R35/R57). Groups are
+  # created in monitoring.tf.
   statement {
     sid    = "LogsWrite"
     effect = "Allow"
@@ -77,6 +84,8 @@ data "aws_iam_policy_document" "execution" {
     resources = [
       aws_cloudwatch_log_group.task.arn,
       "${aws_cloudwatch_log_group.task.arn}:*",
+      aws_cloudwatch_log_group.serviceconnect.arn,
+      "${aws_cloudwatch_log_group.serviceconnect.arn}:*",
     ]
   }
 }
@@ -149,4 +158,125 @@ resource "aws_iam_role_policy" "task" {
   name   = "${var.project_name}-task"
   role   = aws_iam_role.task.id
   policy = data.aws_iam_policy_document.task.json
+}
+
+# --- LiteLLM roles (R38, R53, D6.10) ---------------------------------------
+#
+# Separate execution and task roles for the gateway, NOT shared with the gate,
+# so each is scoped to only what the gateway needs.
+
+# LiteLLM execution role: pull the litellm image, write the gateway and Service
+# Connect log streams, and read the master-key secret at container start.
+resource "aws_iam_role" "litellm_execution" {
+  name               = "${var.project_name}-litellm-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+
+  tags = { Name = "${var.project_name}-litellm-execution" }
+}
+
+data "aws_iam_policy_document" "litellm_execution" {
+  # ECR pull scoped to the litellm repository ONLY (D6.10: the reason the two
+  # images are separate repositories). GetAuthorizationToken is the one
+  # unavoidable wildcard AWS will not let us scope.
+  statement {
+    sid       = "EcrAuthToken"
+    effect    = "Allow"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "EcrPull"
+    effect = "Allow"
+    actions = [
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchCheckLayerAvailability",
+    ]
+    resources = [data.aws_ecr_repository.litellm.arn]
+  }
+
+  # Logs on the gateway's own log group and the Service Connect sidecar log
+  # group (the execution role sets up log streams for both the app container and
+  # the Envoy sidecar).
+  statement {
+    sid    = "LogsWrite"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = [
+      aws_cloudwatch_log_group.litellm.arn,
+      "${aws_cloudwatch_log_group.litellm.arn}:*",
+      aws_cloudwatch_log_group.serviceconnect.arn,
+      "${aws_cloudwatch_log_group.serviceconnect.arn}:*",
+    ]
+  }
+
+  # Read the master-key secret at container start (injected via the `secrets`
+  # block). GetSecretValue on exactly that secret.
+  statement {
+    sid       = "MasterKeyRead"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.litellm_master_key.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "litellm_execution" {
+  name   = "${var.project_name}-litellm-execution"
+  role   = aws_iam_role.litellm_execution.id
+  policy = data.aws_iam_policy_document.litellm_execution.json
+}
+
+# LiteLLM task role: Bedrock ONLY (R53). InvokeModel and
+# InvokeModelWithResponseStream on (1) the EU inference profile ARN and (2) the
+# foundation-model ARNs it routes to. The foundation-model statement is
+# conditioned on bedrock:InferenceProfileArn = the profile ARN, so the role can
+# reach those models only THROUGH the EU profile, never directly (this is A14's
+# IAM layer). All ARNs come from the data source (main.tf), not typed.
+resource "aws_iam_role" "litellm_task" {
+  name               = "${var.project_name}-litellm-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+
+  tags = { Name = "${var.project_name}-litellm-task" }
+}
+
+data "aws_iam_policy_document" "litellm_task" {
+  # Invoke the inference profile itself.
+  statement {
+    sid    = "InvokeEuProfile"
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
+    resources = [local.bedrock_profile_arn]
+  }
+
+  # Invoke the routed foundation models, but ONLY via the EU profile: the
+  # condition ties every such call to the profile ARN, so the role cannot invoke
+  # a foundation model directly or through any other profile.
+  statement {
+    sid    = "InvokeEuFoundationModelsViaProfile"
+    effect = "Allow"
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
+    resources = local.bedrock_model_arns
+
+    condition {
+      test     = "StringEquals"
+      variable = "bedrock:InferenceProfileArn"
+      values   = [local.bedrock_profile_arn]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "litellm_task" {
+  name   = "${var.project_name}-litellm-task"
+  role   = aws_iam_role.litellm_task.id
+  policy = data.aws_iam_policy_document.litellm_task.json
 }

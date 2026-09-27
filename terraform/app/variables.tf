@@ -29,9 +29,12 @@ variable "project_name" {
 variable "dns_zone_name" {
   description = <<-EOT
     Fully qualified name of the delegated DNS zone created by the bootstrap
-    stack, e.g. "bouncer.example.com". The service is served at the zone APEX
-    (D4.2): the certificate is looked up for this exact name and the apex A alias
-    points at the ALB. No default -- a reader supplies their own (R3).
+    stack, e.g. "bouncer.example.com". The gateway is served at
+    `$${gateway_host_label}.$${dns_zone_name}` (default `llm.<zone>`, D6.10), not
+    at the apex: G1 removed the apex A alias (dns.tf). The bootstrap certificate
+    is a wildcard (`*.<zone>`, bootstrap certificate.tf) so it already covers the
+    gateway host and no certificate change is needed. No default -- a reader
+    supplies their own (R3).
   EOT
   type        = string
 
@@ -85,6 +88,53 @@ variable "image_tag" {
   validation {
     condition     = length(trimspace(var.image_tag)) > 0
     error_message = "image_tag must not be empty."
+  }
+}
+
+variable "litellm_image_tag" {
+  description = "Tag of the thin LiteLLM gateway image in the bootstrap litellm ECR repository to run (G1, D6.10)."
+  type        = string
+  default     = "latest"
+
+  validation {
+    condition     = length(trimspace(var.litellm_image_tag)) > 0
+    error_message = "litellm_image_tag must not be empty."
+  }
+}
+
+variable "bedrock_inference_profile_id" {
+  description = <<-EOT
+    Bedrock inference profile id the gateway routes to (R53, D6.10). Must be an
+    EU (`eu.`) profile so models stay EU-only; the aws_bedrock_inference_profile
+    data source is keyed by this, and a lifecycle postcondition additionally
+    asserts every routed foundation-model region begins with `eu-`. This is
+    project design, not an environment value (it matches the model id in
+    gateway/litellm.yaml), so a default is appropriate.
+  EOT
+  type        = string
+  default     = "eu.anthropic.claude-sonnet-5"
+
+  validation {
+    condition     = startswith(var.bedrock_inference_profile_id, "eu.")
+    error_message = "bedrock_inference_profile_id must be an EU inference profile (start with \"eu.\") so models stay EU-only (R53)."
+  }
+}
+
+variable "gateway_host_label" {
+  description = <<-EOT
+    DNS label for the gateway host under the delegated zone (D6.10): the ALB
+    serves the gateway at `$${gateway_host_label}.$${dns_zone_name}` and nothing
+    else. Default "llm". A label, not a full name -- the zone name is a separate
+    variable -- so no domain is hardcoded here (R3).
+  EOT
+  type        = string
+  default     = "llm"
+
+  validation {
+    # A single DNS label: 1-63 chars, lowercase alphanumeric and hyphens, not
+    # starting or ending with a hyphen.
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", var.gateway_host_label))
+    error_message = "gateway_host_label must be a single DNS label, for example \"llm\"."
   }
 }
 

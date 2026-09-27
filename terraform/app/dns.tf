@@ -1,11 +1,16 @@
-# The service is served at the zone APEX (D4.2), so the record name is the zone
-# name itself. An A alias to the ALB rather than a CNAME, because a zone apex
-# cannot hold a CNAME -- an alias is Route53's apex-safe equivalent and resolves
-# to the ALB's addresses with no extra lookup.
-
-resource "aws_route53_record" "apex" {
+# The gateway is served at `${gateway_host_label}.${dns_zone_name}` (D6.10), so
+# this is an A alias for that host, not the apex. The apex record is deliberately
+# REMOVED: the ALB's HTTPS listener answers only the gateway host and returns 404
+# for everything else, so an apex record would resolve to an endpoint that never
+# serves. An alias (not a CNAME) resolves straight to the ALB's addresses.
+#
+# No certificate change is needed: the bootstrap certificate carries a
+# `*.${dns_zone_name}` subject alternative name (terraform/bootstrap/
+# certificate.tf), and `${gateway_host_label}.${dns_zone_name}` is a single
+# label under the zone, so the wildcard covers it.
+resource "aws_route53_record" "gateway" {
   zone_id = data.aws_route53_zone.this.zone_id
-  name    = var.dns_zone_name
+  name    = local.gateway_host
   type    = "A"
 
   alias {

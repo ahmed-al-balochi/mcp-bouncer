@@ -1,0 +1,5 @@
+# The gateway build context is this directory only. Only litellm.yaml and the
+# Dockerfile are needed; exclude everything else so nothing else can leak into
+# an image layer, and so the context stays tiny.
+*
+!litellm.yaml

@@ -1,9 +1,15 @@
-# ECS Fargate: one cluster, one task definition, one container, one service
-# (R35). The container runs the gate over HTTP with the demo upstream spawned
-# over stdio -- the same command the local demo runs, no deployed-only code path.
+# ECS Fargate: one cluster, and the GATE task definition + service (R35). The
+# gate runs over HTTP with the demo upstream spawned over stdio -- the same
+# command the local demo runs, no deployed-only code path. The LiteLLM gateway
+# task/service live in gateway.tf.
 #
-# Task size is fixed by the owner at the smallest Fargate size, 0.25 vCPU / 512
-# MB (D4.3): cpu 256, memory 512.
+# The gate is now INTERNAL-ONLY (R52): it is reached only by the LiteLLM gateway
+# over ECS Service Connect, never from the ALB. It is registered as a Service
+# Connect SERVER (the gateway is the client).
+#
+# Task size is set by the owner at 0.5 vCPU / 1 GB (D6.9): cpu 512, memory 1024.
+# Raised from 0.25/512 (D4.3) because the Service Connect sidecar wants +256 CPU
+# and >=64 MiB per task, and Fargate requires >=1024 MB once CPU is 512.
 
 resource "aws_ecs_cluster" "this" {
   name = var.project_name
@@ -15,8 +21,8 @@ resource "aws_ecs_task_definition" "this" {
   family                   = var.project_name
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
+  cpu                      = "512"
+  memory                   = "1024"
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
 
@@ -74,6 +80,11 @@ resource "aws_ecs_task_definition" "this" {
           # omitted, which Terraform then sees as drift (D4.14).
           hostPort = local.container_port
           protocol = "tcp"
+          # Named for ECS Service Connect (D6.8): the service's server config
+          # references this port by name. appProtocol http so the sidecar speaks
+          # HTTP to the gate (enabling per-request timeouts and HTTP metrics).
+          name        = "gate"
+          appProtocol = "http"
         }
       ]
 
@@ -91,9 +102,29 @@ resource "aws_ecs_task_definition" "this" {
         }
       }
 
-      # NO healthCheck: python:3.12-slim has neither curl nor wget, so a
-      # container-level check that shelled out would always fail. The ALB target
-      # group probes /health instead (NOTES, D3.1).
+      # Container health check via Python (D6.10). The gate is no longer behind
+      # the ALB (R52), so the ALB target-group probe that used to replace a
+      # wedged task is gone; without a container check a hung gate would never be
+      # replaced. The image is python:3.12-slim (root Dockerfile FROM), which has
+      # `python` on PATH but neither curl nor wget, so the check is a one-line
+      # urllib GET of the unauthenticated /health route that exits non-zero
+      # unless it returns HTTP 200.
+      #
+      # startPeriod is 90 s: the stdio upstream warm-up measured ~18 s at 0.25
+      # vCPU (D5.10) and the gate turns healthy only after it; 90 s leaves ample
+      # margin at 0.5 vCPU so a slow cold start is not counted as a failure.
+      healthCheck = {
+        command = [
+          "CMD",
+          "python",
+          "-c",
+          "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)",
+        ]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 90
+      }
 
       environment = [
         # Identity source MUST be secretsmanager: the default is "local", and
@@ -114,15 +145,16 @@ resource "aws_ecs_task_definition" "this" {
         { name = "AWS_REGION", value = var.aws_region },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         { name = "BOUNCER_LOG_LEVEL", value = "INFO" },
-        # Trust X-Forwarded-Proto ONLY from the ALB's own subnets. TLS ends at
-        # the ALB, so without this uvicorn sees plain HTTP and any redirect it
-        # issues -- e.g. Starlette's `/mcp/` -> `/mcp` -- points at http://,
-        # which makes a following client re-send the request body in cleartext
-        # (DECISIONS D4.16). uvicorn reads this variable when its config leaves
-        # forwarded_allow_ips unset (verified in uvicorn 0.53.0). Scoped to the
-        # public subnet CIDRs rather than "*" so the trust does not rest on the
-        # task security group alone.
-        { name = "FORWARDED_ALLOW_IPS", value = join(",", local.public_subnet_cidrs) },
+        # FORWARDED_ALLOW_IPS is deliberately removed. It existed so uvicorn
+        # would trust the ALB's X-Forwarded-Proto and not downgrade a `/mcp/`
+        # redirect to http:// (D4.16). The gate is no longer behind the ALB
+        # (R52): only the LiteLLM gateway reaches it, in-cluster over Service
+        # Connect, addressed as http://gate:8000/mcp with no trailing slash and
+        # no TLS-terminating proxy in front, so there is no X-Forwarded-Proto to
+        # trust and no scheme-downgrade redirect to guard against. The Python
+        # regression test in tests/test_health.py sets this variable itself and
+        # pins uvicorn's behaviour at the app level; it does not read the
+        # Terraform value, so it is unaffected by this removal.
         # No BOUNCER_POLICY: the image's WORKDIR is /app and policy.yaml is at
         # /app/policy.yaml, so the registry's default path (cwd/policy.yaml)
         # already resolves it (verified in gate/registry.py default_policy_path).
@@ -165,17 +197,45 @@ resource "aws_ecs_service" "this" {
     assign_public_ip = false
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.this.arn
-    container_name   = var.project_name
-    container_port   = local.container_port
-  }
+  # No load_balancer block and no health_check_grace_period_seconds: the gate is
+  # internal-only now (R52), reached over Service Connect, not through the ALB.
+  # ECS rejects healthCheckGracePeriodSeconds unless the service has a load
+  # balancer, so it must go with the load_balancer block; the container-level
+  # healthCheck (with its 90 s startPeriod) covers the boot warm-up instead.
+  #
+  # Register the gate as a Service Connect SERVER so the LiteLLM gateway can
+  # reach it as `gate` (D6.8, D6.10). The server advertises the named port
+  # "gate" under the DNS alias `gate` on port 8000. Timeouts are set explicitly
+  # (perRequest 120 s, idle 300 s) so a slow model/tool round or an SSE stream is
+  # not cut at the 15 s default (D6.8/D6.10). The Envoy sidecar logs to its own
+  # log group.
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_http_namespace.this.arn
 
-  # Give the task time to boot (resolve the secret, reach DynamoDB, start
-  # uvicorn) before the ALB starts failing it. The boot does real network I/O to
-  # the endpoints, so a too-short grace would kill a task that is merely still
-  # starting.
-  health_check_grace_period_seconds = 120
+    service {
+      port_name = "gate"
+
+      client_alias {
+        dns_name = "gate"
+        port     = local.container_port
+      }
+
+      timeout {
+        per_request_timeout_seconds = 120
+        idle_timeout_seconds        = 300
+      }
+    }
+
+    log_configuration {
+      log_driver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.serviceconnect.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "gate-connect"
+      }
+    }
+  }
 
   # Roll back automatically if a new task definition fails to become healthy,
   # rather than leaving a wedged deployment.

@@ -1,0 +1,97 @@
+# LiteLLM gateway config for mcp-bouncer (R51, R55, R56, R57; D6.10).
+#
+# This file is baked into the thin gateway image (gateway/Dockerfile). It holds
+# NO environment-specific values: the master key and the region arrive at
+# runtime from the environment, and the gate is addressed by its Service Connect
+# name, not an IP or a domain (R2, R3). Derived from the local spike config
+# proven end to end on 2026-09-27 (.venv-litellm/spike/litellm.yaml, D6.5),
+# with the spike's literal region and literal master key replaced by
+# `os.environ/` references for the deployment.
+
+model_list:
+  # Exactly one model. It names ONLY the EU inference profile, which is layer 1
+  # of the three EU-only layers (R53): a request for any other model name is
+  # refused by LiteLLM before it reaches Bedrock (verified in the spike: `us.`
+  # and `global.` profiles return 400 "Invalid model name", D6.5). IAM and the
+  # bedrock-runtime VPC endpoint policy are layers 2 and 3.
+  - model_name: claude-sonnet-5-eu
+    litellm_params:
+      # bedrock/<inference-profile-id>. The `eu.` prefix is the EU-only profile;
+      # this id is also asserted by tests/test_gateway_config.py to equal the
+      # default of bedrock_inference_profile_id in terraform/app/variables.tf, so
+      # the model the gateway calls and the ARNs IAM authorises cannot drift
+      # apart.
+      model: bedrock/eu.anthropic.claude-sonnet-5
+      # The region is supplied at runtime, never hardcoded (R2, R3). LiteLLM
+      # resolves `os.environ/<VAR>` references inside litellm_params: the proxy
+      # walks the whole config dict through _resolved_config_value, and any
+      # string beginning with `os.environ/` is passed to get_secret(), which
+      # strips the prefix and reads the environment variable.
+      # Verified in litellm 1.103.0:
+      #   proxy/proxy_server.py:5316  (_resolved_config_value resolves os.environ/ in any nested value)
+      #   secret_managers/main.py:197 (get_secret strips "os.environ/" and reads the env var)
+      aws_region_name: os.environ/AWS_REGION
+
+litellm_settings:
+  # Sonnet 5 REJECTS `temperature` ("deprecated for this model", observed in the
+  # spike, D6.5). drop_params makes LiteLLM silently drop unsupported params
+  # rather than passing them through to a ValidationException. Handled explicitly
+  # by the config loader (proxy/proxy_server.py:6144, key == "drop_params").
+  drop_params: true
+
+  # Do NOT log prompts or responses (R56). turn_off_message_logging redacts the
+  # messages/prompt/input/response from every logging callback and from the
+  # in-memory logging path: should_redact_message_logging() returns True when
+  # litellm.turn_off_message_logging is True, and redact_message_input_output_
+  # from_logging() then strips the content.
+  # Verified in litellm 1.103.0:
+  #   litellm_core_utils/redact_messages.py:373 (global setting honoured)
+  #   litellm_core_utils/redact_messages.py:379 (what it redacts)
+  # The setting reaches litellm.turn_off_message_logging through the config
+  # loader's catch-all setattr(litellm, key, value) (proxy/proxy_server.py:6152).
+  turn_off_message_logging: true
+
+  # JSON logs to stdout so CloudWatch (awslogs) ingests one JSON object per line,
+  # the same pipeline as the gate (D6.6). Handled explicitly by the loader
+  # (proxy/proxy_server.py:6131, key == "json_logs"), which calls
+  # litellm._turn_on_json().
+  json_logs: true
+
+  # Disable LiteLLM's phone-home telemetry (R57 spirit: no unexpected egress).
+  # litellm.telemetry defaults to True (litellm/__init__.py:243); setting it
+  # false here flips it via the loader's catch-all setattr (proxy/proxy_server.py:6152).
+  # In the no-internet VPC any telemetry call would fail anyway; turning it off
+  # means the gateway does not attempt it.
+  telemetry: false
+
+mcp_servers:
+  # The tool gate, reachable ONLY by its Service Connect name inside the VPC
+  # (D4.16, D6.10). No trailing slash: `/mcp/` 307-redirects to plain http://
+  # and would strip the scheme, so the endpoint is exactly `/mcp` (D4.16).
+  bouncer:
+    url: "http://gate:8000/mcp"
+    transport: "http"
+    description: "mcp-bouncer governance gate"
+    # Deliberately invalid static credential (R54, D6.10). Each agent forwards
+    # its OWN gate token per request as `x-mcp-bouncer-authorization: Bearer
+    # <token>` (LiteLLM's x-mcp-<alias>-<header> forwarding). This auth_value is
+    # only the fallback LiteLLM would use if an agent forgot its header; making
+    # it a token the gate will never accept means a request with no forwarded
+    # token is refused (401) rather than silently defaulted to a working
+    # credential. Fail closed, never defaulted.
+    auth_type: "bearer_token"
+    auth_value: "no-default-token"
+
+general_settings:
+  # LiteLLM's master key -- and, without a database, its ONLY key and its ADMIN
+  # key (R55, D6.6). Generated at provision time, stored in Secrets Manager, and
+  # injected as LITELLM_MASTER_KEY; it never appears here, in the image, or in
+  # the repository. LiteLLM reads general_settings.master_key and resolves an
+  # `os.environ/` reference (proxy/proxy_server.py:6216-6217). The generated key
+  # is given a virtual-key prefix in Terraform: the master key is matched by an
+  # exact secrets.compare_digest (proxy/auth/user_api_key_auth.py:2036), so a
+  # value without that prefix would still authenticate, but several virtual-key
+  # code paths branch on the conventional prefix (proxy/proxy_server.py:3584),
+  # so following the convention is the safe choice. See secrets.tf for the exact
+  # prefix chosen.
+  master_key: os.environ/LITELLM_MASTER_KEY
