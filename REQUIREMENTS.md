@@ -15,6 +15,10 @@ concept on AWS. Every tool call an agent makes is classified as `read`, `write`,
 or `destructive`. Reads and writes pass. Tools the policy does not recognise are
 `unknown` and denied. Destructive calls are parked until a human approves them.
 
+Agents reach models and tools only through an LLM gateway (LiteLLM). Model calls
+go to EU-only Amazon Bedrock models; tool calls go through the gate, which is
+reachable from the gateway and from nowhere else.
+
 It is a **POC**, not a product. Small and complete beats large and half done.
 A reviewer must be able to clone the repo, read one README, and either run it
 locally in two minutes or deploy it with two `terraform apply` commands.
@@ -128,20 +132,44 @@ None may regress.
 - **R33** Structured logs to stdout, captured by CloudWatch Logs. No prompt or
   tool-argument content in logs — argument hashes only.
 
+### 4.5 LLM gateway
+
+- **R51** LiteLLM is the only path to models and to the gate. It runs as its
+  own Fargate service behind the existing ALB.
+- **R52** The gate is internal-only: its security group admits the gateway
+  alone, and the ALB has no rule that reaches it.
+- **R53** Models are EU-only, enforced in three independent layers: LiteLLM's
+  model list names only the `eu.` inference profile; IAM allows
+  `bedrock:InvokeModel` only on that profile and the EU foundation-model ARNs
+  it routes to; the `bedrock-runtime` VPC endpoint policy is resource-scoped to
+  the same ARNs.
+- **R54** Agents authenticate to the gate with their own gate token, forwarded
+  through LiteLLM on each request. A missing or wrong token fails closed: no
+  tool runs.
+- **R55** LiteLLM's master key is generated at provision time and stored in
+  Secrets Manager; it never appears in configuration, the image or the
+  repository. It is shared by all agents, which is a documented limitation.
+- **R56** Gateway logs go to CloudWatch Logs. Prompts and responses are not
+  logged.
+- **R57** The gateway, like the gate, has no internet path. It works entirely
+  through VPC endpoints.
+
 ## 5. Infrastructure requirements
 
 - **R34** Terraform, split into two stacks:
   - `bootstrap/` — Route53 hosted zone and ECR repository. Applied once, never
     destroyed, so the DNS delegation stays valid and the image survives.
-  - `app/` — everything else. Applied and destroyed freely.
-- **R35** ECS Fargate, one task definition, one container. The gate spawns the
-  demo upstream MCP server over stdio exactly as the local demo does, so there
-  is no deployed-only code path.
+  - `app/` — everything else, including the LLM gateway service. Applied and
+    destroyed freely.
+- **R35** ECS Fargate, two services, one container each: the LLM gateway and
+  the gate. The gate spawns the demo upstream MCP server over stdio exactly as
+  the local demo does, so there is no deployed-only code path.
 - **R36** ALB with an HTTPS listener, an ACM certificate validated by DNS, and
   HTTP redirecting to HTTPS.
 - **R37** The ALB security group allows only an operator-supplied list of source
   IP addresses. Default behaviour discovers the applier's own public IP; a
-  variable overrides it.
+  variable overrides it. The ALB is the gateway's public entry point; the gate
+  has no public entry point (R52).
 - **R38** IAM roles are least privilege. The task role gets exactly the
   DynamoDB actions it uses on exactly its own table, and read on exactly its own
   secret. No wildcards on resources.
@@ -218,6 +246,9 @@ Stated plainly in the README rather than left to be discovered:
 - A UI. The operator surface is a CLI.
 - Multi-region, autoscaling, disaster recovery.
 - Prompt-injection detection in tool output.
+- Per-agent gateway keys, model allowlists and budgets (they need a database).
+- Trace storage such as Langfuse; Redis; external model providers; data
+  classes.
 
 ## 9. Acceptance criteria
 
@@ -225,7 +256,8 @@ Verifiable, in order:
 
 - **A1** `pytest` passes, including the original 68 tests.
 - **A2** A read passes; an unclassified tool is denied; a destructive call parks
-  and returns an approval id — all through the real proxy.
+  and returns an approval id — all through the real proxy. On the deployed
+  stack this is shown through the gateway, with a model in the loop.
 - **A3** An approval releases exactly one call. A replay of the identical call
   parks again. Concurrent consumers of one grant produce exactly one winner.
 - **A4** A grant for one set of arguments does not release a different set.
@@ -237,10 +269,19 @@ Verifiable, in order:
 - **A7** A team override that loosens the baseline prevents boot.
 - **A8** The DynamoDB store passes the same store test suite as SQLite.
 - **A9** `terraform apply` in `bootstrap/` then `app/` produces a reachable
-  HTTPS endpoint on the operator's own domain, and the ALB refuses a source IP
-  outside the allowlist.
+  HTTPS gateway endpoint on the operator's own domain, and the ALB refuses a
+  source IP outside the allowlist. The gate itself is not reachable from the
+  internet.
 - **A10** The park, approve, retry loop completes against the deployed endpoint
   with approvals granted from the CLI against DynamoDB.
 - **A11** `terraform destroy` in `app/` succeeds and leaves no billable
   resources.
 - **A12** `git grep` finds no company name, no domain, no token, no account id.
+- **A13** The model-driven loop works on the deployed stack: a model requests a
+  destructive call, the call parks, a human approves it from the CLI, and the
+  model's retry is released exactly once.
+- **A14** A non-EU model is refused at LiteLLM, and separately the gateway's
+  task role cannot invoke a non-EU inference profile directly (IAM denies it,
+  shown live).
+- **A15** The gate does not answer from the internet, only from the gateway.
+- **A16** An agent without a gate token cannot run any tool.
