@@ -64,7 +64,7 @@ directory, so the `bouncer` CLI reads the same local database the server writes:
 export BOUNCER_DEMO_TOKEN=demo-token
 
 python demo/agent.py wiki.read_page '{"title": "home"}'      # passes
-python demo/agent.py wiki.nuke_everything '{}'               # unknown: denied
+python demo/agent.py wiki.rename_page '{"title": "home", "new_title": "index"}'  # unknown: denied
 python demo/agent.py wiki.delete_page '{"title": "home"}'    # parks, prints an id
 ```
 

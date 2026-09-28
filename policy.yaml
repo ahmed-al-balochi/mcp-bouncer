@@ -30,6 +30,10 @@ tools:
   "wiki.read_page": read
   "wiki.write_page": write
   "wiki.delete_page": destructive
+  # wiki.rename_page is intentionally NOT listed: the demo upstream serves it as
+  # a real tool so the gate classifies it `unknown` and denies it (R8, A2) --
+  # the realistic case of an upstream growing a tool the policy has not
+  # classified yet. Do not add it here; that is the whole point of the demo.
 
 actions:
   # What to do with each classification. `approve` means park the call and wait
