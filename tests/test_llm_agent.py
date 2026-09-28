@@ -49,6 +49,15 @@ class _Recorder:
         self.body: dict[str, Any] = _completion("done")
         # For the redaction test: an error body that echoes the secrets back.
         self.error_body: dict[str, Any] = {"error": {"message": "boom"}}
+        # Preflight (GET /mcp-rest/tools/list) scripting. By default the gateway
+        # reports one bouncer tool, so the preflight is satisfied and completion
+        # proceeds -- this keeps the pre-existing completion tests passing (D6.22).
+        # A test sets preflight_status to a 4xx/5xx to exercise the error paths,
+        # or preflight_tools to [] to exercise the zero-tools refusal.
+        self.preflight_status: int = 200
+        self.preflight_tools: list[dict[str, Any]] = [
+            {"name": "wiki.read_page", "mcp_info": {"server_name": "bouncer"}}
+        ]
 
 
 def _completion(content: str) -> dict[str, Any]:
@@ -74,11 +83,40 @@ def _make_handler(recorder: _Recorder):
         def log_message(self, *args: Any) -> None:  # noqa: D401
             return
 
+        def do_GET(self) -> None:  # noqa: N802 (http.server API)
+            # The only GET the agent makes is the preflight to
+            # /mcp-rest/tools/list (D6.22). Record it (path + headers) so tests
+            # can assert the credentials it carried, then answer per the recorder.
+            recorder.requests.append(
+                {
+                    "method": "GET",
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "body": None,
+                }
+            )
+            status = recorder.preflight_status
+            if status == 200:
+                payload: dict[str, Any] = {
+                    "tools": recorder.preflight_tools,
+                    "error": None,
+                    "message": "Successfully retrieved tools",
+                }
+            else:
+                payload = {"error": {"message": "preflight error"}}
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length else b""
             recorder.requests.append(
                 {
+                    "method": "POST",
                     "path": self.path,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                     "body": json.loads(raw) if raw else None,
@@ -135,6 +173,20 @@ def _env(url: str, *, token: str | None = FAKE_TOKEN) -> dict[str, str]:
     return env
 
 
+def _posts(recorder: _Recorder) -> list[dict[str, Any]]:
+    """The completion requests (POST /v1/chat/completions) the server recorded.
+
+    Filtering by method keeps the completion assertions independent of the
+    preflight GET, which now precedes every completion by default (D6.22).
+    """
+    return [r for r in recorder.requests if r["method"] == "POST"]
+
+
+def _gets(recorder: _Recorder) -> list[dict[str, Any]]:
+    """The preflight requests (GET /mcp-rest/tools/list) the server recorded."""
+    return [r for r in recorder.requests if r["method"] == "GET"]
+
+
 # --- what the SDK actually sends -------------------------------------------
 
 
@@ -148,8 +200,11 @@ def test_request_shape_on_the_wire(server, capsys):
     )
     assert rc == 0
 
-    assert len(recorder.requests) == 1
-    req = recorder.requests[0]
+    # Exactly one completion request (the preflight GET precedes it; asserted in
+    # its own test). Filter by method so this stays about the completion shape.
+    posts = _posts(recorder)
+    assert len(posts) == 1
+    req = posts[0]
 
     # Path: the SDK appends /chat/completions to the /v1 base_url.
     assert req["path"] == "/v1/chat/completions"
@@ -191,7 +246,7 @@ def test_model_flag_passes_through(server, capsys):
         config, model="some-other-model", prompt="hi", with_gate_token=True
     )
     assert rc == 0
-    assert recorder.requests[0]["body"]["model"] == "some-other-model"
+    assert _posts(recorder)[0]["body"]["model"] == "some-other-model"
 
 
 # --- config errors ---------------------------------------------------------
@@ -244,16 +299,31 @@ def test_missing_gate_token_refuses_by_default(server):
 
 
 def test_without_gate_token_sends_no_gate_header_anywhere(server, capsys):
-    """--without-gate-token: the request carries NO gate-token header at all."""
+    """--without-gate-token: NO preflight, and the request carries NO gate header.
+
+    Mirrors main()'s wiring: --without-gate-token skips the preflight (A16 expects
+    zero tools, so a preflight would correctly refuse and defeat the demo, D6.22)
+    and sends no gate-token header anywhere. Proves the A16 path stays intact.
+    """
     url, recorder = server
     # No token in env, and the flag lets config load anyway.
     config = llm_agent.load_config(_env(url, token=None), require_gate_token=False)
     rc = llm_agent.run(
-        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=False
+        config,
+        model="claude-sonnet-5-eu",
+        prompt="hi",
+        with_gate_token=False,
+        preflight=False,
     )
     assert rc == 0
 
-    req = recorder.requests[0]
+    # No preflight GET was made (the whole point under --without-gate-token).
+    assert _gets(recorder) == []
+
+    # The completion still went out.
+    posts = _posts(recorder)
+    assert len(posts) == 1
+    req = posts[0]
     # The tool block exists but has no headers key.
     tool = req["body"]["tools"][0]
     assert tool["type"] == "mcp"
@@ -329,4 +399,239 @@ def test_max_retries_zero_means_exactly_one_request(server, capsys):
         config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
     )
     assert rc == 1
-    assert len(recorder.requests) == 1
+    assert len(_posts(recorder)) == 1
+
+
+# --- the preflight (D6.22) -------------------------------------------------
+
+
+def test_preflight_carries_master_key_and_gate_token(server, capsys):
+    """The preflight GET sends the gateway key as bearer AND the gate-token header.
+
+    This is the property that makes the preflight test the SAME credential the
+    tool call uses (D6.22): the LiteLLM master key as the request Authorization
+    bearer (the REST route's user_api_key_auth), and the gate token in the
+    x-mcp-bouncer-authorization header the REST handler parses off request.headers.
+
+    Not vacuous: if the preflight omitted either header, the corresponding
+    assertion below would fail. Verified by temporarily dropping each header from
+    preflight_tool_names -> this test failed on that header.
+    """
+    url, recorder = server
+    config = llm_agent.load_config(_env(url), require_gate_token=True)
+
+    rc = llm_agent.run(
+        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
+    )
+    assert rc == 0
+
+    gets = _gets(recorder)
+    assert len(gets) == 1
+    pf = gets[0]
+
+    # Exact path and query the LiteLLM REST route expects (rest_endpoints.py:858).
+    assert pf["path"] == "/mcp-rest/tools/list?mcp_server_name=bouncer"
+    # Master key as the request bearer (the route's Depends(user_api_key_auth)).
+    assert pf["headers"]["authorization"] == f"Bearer {FAKE_KEY}"
+    # Gate token in the per-server MCP auth header (parsed off request.headers).
+    assert pf["headers"][llm_agent.GATE_TOKEN_HEADER] == f"Bearer {FAKE_TOKEN}"
+
+    # The completion still went out after a satisfied preflight.
+    assert len(_posts(recorder)) == 1
+
+
+def test_preflight_zero_tools_refuses_before_any_completion(server, capsys):
+    """Zero bouncer tools -> exit non-zero, NO completion request at all (D6.22).
+
+    The core D6.21 fix: the model is never asked when it would have no tools.
+
+    Not vacuous: the assertion that _posts(recorder) is empty fails if the agent
+    fell through to the model; the rc==1 assertion fails if it did not refuse.
+    Verified by temporarily making preflight_or_raise return on empty -> this
+    test failed (a completion POST appeared and rc was 0).
+    """
+    url, recorder = server
+    recorder.preflight_tools = []  # gateway reports no bouncer tools
+
+    config = llm_agent.load_config(_env(url), require_gate_token=True)
+    rc = llm_agent.run(
+        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
+    )
+    assert rc == 1
+
+    # A preflight GET happened, but NO completion POST.
+    assert len(_gets(recorder)) == 1
+    assert _posts(recorder) == []
+
+    captured = capsys.readouterr()
+    # The message names neither the key nor the token.
+    assert FAKE_KEY not in captured.err
+    assert FAKE_TOKEN not in captured.err
+    # It is actionable and does not guess the cause: it names both likely causes.
+    assert "no tools" in captured.err.lower()
+    assert "rotated" in captured.err.lower()
+    assert "unreachable" in captured.err.lower()
+    assert captured.out == ""
+
+
+def test_preflight_401_refuses_with_distinct_message(server, capsys):
+    """A preflight 401 -> non-zero, a credential-rejection message, no completion.
+
+    Not vacuous: rc==1 fails if the agent proceeded; the 'credential' wording and
+    the empty _posts assertion fail if the wrong branch ran or the model was
+    asked. Verified by pointing preflight_status at 200 -> this test failed.
+    """
+    url, recorder = server
+    recorder.preflight_status = 401
+
+    config = llm_agent.load_config(_env(url), require_gate_token=True)
+    rc = llm_agent.run(
+        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
+    )
+    assert rc == 1
+    assert _posts(recorder) == []
+
+    captured = capsys.readouterr()
+    assert "401" in captured.err
+    assert "credential" in captured.err.lower()
+    # Distinct from the 404 message: it must NOT talk about a version skew.
+    assert "version skew" not in captured.err.lower()
+    # It must name BOTH candidate credentials, not just the gateway key: measured
+    # live, a gate token the gate rejects surfaces as 401 on this route, so a
+    # message blaming only the gateway key would misdirect the rotation case
+    # (D6.23). The two are indistinguishable from here.
+    assert "gate token" in captured.err.lower()
+    assert "gateway key" in captured.err.lower()
+    assert FAKE_KEY not in captured.err
+    assert FAKE_TOKEN not in captured.err
+    assert captured.out == ""
+
+
+def test_preflight_404_says_route_may_be_absent(server, capsys):
+    """A preflight 404 -> non-zero, a version-skew message, no completion (D6.22).
+
+    A 404 specifically should say the gateway may not expose this experimental
+    route (a plausible upstream change), distinct from the 401 message.
+
+    Not vacuous: the 'version skew' wording fails if the 404 branch did not run;
+    the empty _posts assertion fails if the model was asked. Verified by pointing
+    preflight_status at 200 -> this test failed.
+    """
+    url, recorder = server
+    recorder.preflight_status = 404
+
+    config = llm_agent.load_config(_env(url), require_gate_token=True)
+    rc = llm_agent.run(
+        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
+    )
+    assert rc == 1
+    assert _posts(recorder) == []
+
+    captured = capsys.readouterr()
+    assert "404" in captured.err
+    assert "version skew" in captured.err.lower()
+    assert captured.out == ""
+
+
+def test_preflight_connection_error_refuses(capsys):
+    """A preflight that cannot connect -> non-zero, connection-specific message.
+
+    Points the agent at a closed port (nothing listening) so the httpx2 GET
+    raises a ConnectError, which preflight_tool_names must turn into a
+    PreflightError rather than letting the run proceed to the model.
+
+    Not vacuous, and distinct from the zero-tools path: the message must be the
+    connection-failure wording ("could not reach"), NOT the zero-tools wording.
+    Verified by replacing the httpx2.HTTPError branch's `raise` with `return []`
+    -- that made preflight_or_raise raise the ZERO-TOOLS message instead, so the
+    "could not reach" assertion below failed. So this test pins the connection
+    branch specifically, not merely a non-zero exit.
+    """
+    # 127.0.0.1:1 has nothing listening; the SDK's short connect timeout applies.
+    config = llm_agent.load_config(
+        _env("http://127.0.0.1:1/v1"), require_gate_token=True
+    )
+    rc = llm_agent.run(
+        config, model="claude-sonnet-5-eu", prompt="hi", with_gate_token=True
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    # Connection-specific wording, distinct from the zero-tools message.
+    assert "could not reach" in captured.err.lower()
+    assert "no tools" not in captured.err.lower()
+    assert FAKE_KEY not in captured.err
+    assert FAKE_TOKEN not in captured.err
+    assert captured.out == ""
+
+
+def test_no_preflight_flag_skips_the_preflight(server, capsys):
+    """--no-preflight (preflight=False) sends the completion with NO preflight GET.
+
+    Even when the gateway would report zero tools, --no-preflight proceeds to the
+    model -- the documented escape hatch (D6.22).
+
+    Not vacuous: the empty _gets assertion fails if the preflight ran anyway; the
+    single-POST assertion fails if the completion did not go out. Verified by
+    flipping preflight back to True here -> this test failed (a GET appeared and,
+    with zero tools, no POST did).
+    """
+    url, recorder = server
+    recorder.preflight_tools = []  # would refuse if the preflight ran
+
+    config = llm_agent.load_config(_env(url), require_gate_token=True)
+    rc = llm_agent.run(
+        config,
+        model="claude-sonnet-5-eu",
+        prompt="hi",
+        with_gate_token=True,
+        preflight=False,
+    )
+    assert rc == 0
+    assert _gets(recorder) == []
+    assert len(_posts(recorder)) == 1
+
+
+def test_preflight_url_derivation():
+    """preflight_url strips a trailing /v1 and targets the origin sibling path.
+
+    Not vacuous: each assertion pins a specific derivation; a regression that
+    kept /v1 in the path, or hardcoded a host, changes the output and fails here.
+    """
+    assert (
+        llm_agent.preflight_url("https://llm.example.com/v1")
+        == "https://llm.example.com/mcp-rest/tools/list"
+    )
+    assert (
+        llm_agent.preflight_url("https://llm.example.com/v1/")
+        == "https://llm.example.com/mcp-rest/tools/list"
+    )
+    # Host is never hardcoded: a different host flows straight through.
+    assert (
+        llm_agent.preflight_url("http://127.0.0.1:4000/v1")
+        == "http://127.0.0.1:4000/mcp-rest/tools/list"
+    )
+
+
+def test_main_skips_the_preflight_only_for_without_gate_token(server, monkeypatch, capsys):
+    """main() must wire --without-gate-token to preflight=False, and nothing else to it.
+
+    The other tests call run() directly, so a regression that dropped the
+    `and not args.without_gate_token` term would leave them all green while
+    silently breaking A16's demonstration: the preflight would refuse (zero tools
+    is the expected state there) and the model would never be asked. This drives
+    the real entry point instead, and pins the default the other way round too.
+    """
+    url, recorder = server  # the fixture default advertises a bouncer tool
+    for key, value in _env(url, token=FAKE_TOKEN).items():
+        monkeypatch.setenv(key, value)
+
+    # A16 path: no preflight GET, but the completion is still sent.
+    assert llm_agent.main(["--without-gate-token", "hi"]) == 0
+    assert _gets(recorder) == []
+    assert len(_posts(recorder)) == 1
+
+    # Default path: the preflight DOES run (the same wiring, the other branch).
+    recorder.requests.clear()
+    assert llm_agent.main(["hi"]) == 0
+    assert len(_gets(recorder)) == 1
+    assert len(_posts(recorder)) == 1

@@ -1,9 +1,9 @@
 # The internet-facing ALB (R36). HTTPS with the looked-up ACM certificate, HTTP
 # 301-redirecting to HTTPS. The ALB is the only public entry point and it now
 # fronts the LiteLLM gateway ONLY (R51): the HTTPS listener answers a single host
-# and two paths and returns 404 for everything else (D6.10). The gate is not
-# reachable through the ALB at all (R52) -- there is no gate target group and no
-# rule that forwards to the gate.
+# and a small, explicit set of paths and returns 404 for everything else (D6.10,
+# D6.22). The gate is not reachable through the ALB at all (R52) -- there is no
+# gate target group and no rule that forwards to the gate.
 
 resource "aws_lb" "this" {
   name               = var.project_name
@@ -49,9 +49,10 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# The one rule that forwards traffic: only the gateway host, and only the two
-# OpenAI-compatible paths the agents use (D6.10). Everything else falls through
-# to the listener's 404 default. host_header AND path_pattern must both match.
+# The one rule that forwards traffic: only the gateway host, and only the
+# OpenAI-compatible paths the agents use plus the single MCP tools/list path the
+# demo agent's preflight needs (D6.10, D6.22). Everything else falls through to
+# the listener's 404 default. host_header AND path_pattern must both match.
 resource "aws_lb_listener_rule" "gateway" {
   listener_arn = aws_lb_listener.https.arn
   priority     = 100
@@ -64,7 +65,23 @@ resource "aws_lb_listener_rule" "gateway" {
 
   condition {
     path_pattern {
-      values = ["/v1/chat/completions", "/v1/models"]
+      # Extend the SAME rule (not a second rule) with the one extra path: an ALB
+      # path_pattern ORs its values and this rule already carries the exact host
+      # condition, so adding one value is the smaller diff and keeps a single
+      # priority to reason about. Consequence: all three paths share priority 100
+      # and forward to the same LiteLLM target group -- which is what we want,
+      # there is no per-path differentiation to model.
+      #
+      # /mcp-rest/tools/list is opened for the demo agent's preflight (D6.22):
+      # it checks the gateway actually offers the bouncer tools before asking the
+      # model, so a silently-dropped tool set is caught up front (D6.21).
+      #
+      # It is matched EXACTLY, never /mcp-rest/* : ALB path_pattern is an
+      # exact/wildcard literal, so the sibling /mcp-rest/tools/call and the rest
+      # of the /mcp-rest prefix stay on the 404 default. tools/call must stay
+      # closed because it would let any holder of the gateway key invoke tools
+      # directly, bypassing the model-in-the-loop path entirely.
+      values = ["/v1/chat/completions", "/v1/models", "/mcp-rest/tools/list"]
     }
   }
 

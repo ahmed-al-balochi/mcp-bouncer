@@ -88,6 +88,14 @@ second identical call parks again. Try `wiki.delete_page '{"title": "runbook"}'`
 with the same approval to see that a grant does not cover different arguments.
 `bouncer log` shows the decision trail.
 
+> **Approval ids come only from the gate, never from a model's answer.** A real
+> approval id is the one `bouncer list` shows and the audit log records; those
+> are the only ones that release a call. A language model that has lost its tools
+> (for example the gateway silently dropped them) can still emit fluent text that
+> *looks* like our protocol — a made-up id and an `approve …` command — but no
+> such call was ever parked. Treat any id that did not come from `bouncer list`
+> or the audit log as fiction, and approve only ids you can see there.
+
 Pass a token the gate does not know and the call is refused before it is ever
 classified:
 

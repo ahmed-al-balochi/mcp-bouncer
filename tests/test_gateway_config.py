@@ -28,6 +28,7 @@ LITELLM_CONFIG = REPO_ROOT / "gateway" / "litellm.yaml"
 APP_TF_DIR = REPO_ROOT / "terraform" / "app"
 VARIABLES_TF = APP_TF_DIR / "variables.tf"
 ECS_TF = APP_TF_DIR / "ecs.tf"
+ALB_TF = APP_TF_DIR / "alb.tf"
 
 
 def _load_config() -> dict:
@@ -208,4 +209,89 @@ def test_no_target_group_targets_the_gate_port():
         assert not gate_port_pat.search(body), (
             "an aws_lb_target_group targets the gate port (8000 / local.container_port); "
             "the ALB must not reach the gate (R52)"
+        )
+
+
+# --- ALB gateway listener rule: exactly one MCP path opened (D6.22) ---------
+
+
+def _gateway_rule_block(text: str) -> str:
+    """Return the body of the `aws_lb_listener_rule "gateway"` block from alb.tf.
+
+    Same brace-matched slice technique as `_gate_service_block`: from the
+    resource header to its matching close brace, so nested condition/action
+    blocks are included. Not a full HCL parser; its limit is that a stray brace
+    inside a string literal would miscount, which this block does not contain
+    (terraform fmt normalises it and the only strings are path/host literals).
+    """
+    header = re.search(r'resource\s+"aws_lb_listener_rule"\s+"gateway"\s*\{', text)
+    assert header, 'aws_lb_listener_rule "gateway" not found in alb.tf'
+    depth = 0
+    start = header.end() - 1
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise AssertionError("unbalanced braces parsing the gateway rule block")
+
+
+def _gateway_path_values(block: str) -> list[str]:
+    """Extract the quoted values of the rule's path_pattern list.
+
+    Finds the `path_pattern { values = [ ... ] }` list and returns every
+    double-quoted string inside it. Limit: assumes the values are string
+    literals on the list (they are); an expression-valued list would not be
+    captured, but this rule only ever lists literal paths.
+    """
+    m = re.search(r"path_pattern\s*\{.*?values\s*=\s*\[(.*?)\]", block, re.S)
+    assert m, "no path_pattern values list found in the gateway rule"
+    return re.findall(r'"([^"]*)"', m.group(1))
+
+
+def test_gateway_rule_opens_tools_list_exactly():
+    """The one MCP path opened is exactly /mcp-rest/tools/list (D6.22)."""
+    values = _gateway_path_values(_gateway_rule_block(ALB_TF.read_text()))
+    assert "/mcp-rest/tools/list" in values, (
+        "the gateway rule must open /mcp-rest/tools/list for the agent preflight (D6.22)"
+    )
+
+
+def test_gateway_rule_does_not_open_the_whole_mcp_rest_prefix():
+    """R52/D6.22: the rule must NOT wildcard the /mcp-rest prefix.
+
+    An ALB path_pattern wildcard (`/mcp-rest/*`) or a bare `/mcp-rest` prefix
+    would expose tools/call and every other route on the prefix. Guard against
+    both. Limit of this text check: it inspects only the committed path_pattern
+    values of THIS rule; it cannot prove ALB runtime matching semantics, only
+    that no over-broad literal was written.
+    """
+    values = _gateway_path_values(_gateway_rule_block(ALB_TF.read_text()))
+    for v in values:
+        assert "*" not in v, (
+            f"gateway rule path {v!r} uses a wildcard; the MCP prefix must be "
+            "matched exactly, never /mcp-rest/* (D6.22)"
+        )
+        # A value equal to the prefix (with or without a trailing slash) would
+        # also over-open it.
+        assert v.rstrip("/") != "/mcp-rest", (
+            "gateway rule opens the bare /mcp-rest prefix; open only "
+            "/mcp-rest/tools/list (D6.22)"
+        )
+
+
+def test_gateway_rule_does_not_open_tools_call():
+    """R52/D6.22: /mcp-rest/tools/call must stay closed (404).
+
+    tools/call would let any holder of the gateway key invoke tools directly,
+    bypassing the model-in-the-loop path. Assert no path_pattern value mentions
+    tools/call. Limit: a substring check on the committed values; it does not
+    evaluate ALB matching, only that the literal was not opened.
+    """
+    values = _gateway_path_values(_gateway_rule_block(ALB_TF.read_text()))
+    for v in values:
+        assert "tools/call" not in v, (
+            f"gateway rule path {v!r} opens tools/call; it must stay 404 (D6.22)"
         )
