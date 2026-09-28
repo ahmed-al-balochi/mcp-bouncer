@@ -131,6 +131,19 @@ and the gate's own per-call check re-resolves the same token as defence in
 depth. The health endpoint (`/health`) is the sole unauthenticated route; it
 returns a fixed `ok` and reveals nothing.
 
+## Optional dependencies
+
+Two optional extras keep the gate's own runtime slim (R44):
+
+- `aws` (`boto3`) — the DynamoDB store and Secrets Manager token source, needed
+  only when the gate is deployed. The local SQLite path never installs it.
+- `llm-demo` (`openai`, pinned `==3.19.2`) — the `openai` SDK, used only by the
+  real-LLM demo agent (`demo/llm_agent.py`), which calls the deployed LiteLLM
+  gateway's OpenAI-compatible API. It needs a live Bedrock-backed gateway, so it
+  is not part of the gate's runtime and the gate image never installs it. Pinned
+  to the newest release that installs cleanly alongside `fastmcp==4.0.1` without
+  changing any other dependency (it shares fastmcp's httpx/pydantic stack).
+
 ## Layout
 
 ```
