@@ -23,32 +23,56 @@ COPY litellm.yaml /etc/litellm/config.yaml
 # group key off this). Documentation only; ECS maps the port explicitly.
 EXPOSE 4000
 
-# UNVERIFIED ASSUMPTIONS about the base image (its ENTRYPOINT, CMD and USER
-# cannot be inspected here -- Docker is unavailable in this environment):
+# INSPECTED against the base image (litellm v1.103.0, `docker inspect`):
+# ENTRYPOINT ["docker/prod_entrypoint.sh"], CMD ["--port","4000"], USER "root".
+# The script ends in `exec litellm "$@"`, so the CMD below reaches the proxy
+# verbatim, and the base runs as ROOT -- hence the USER further down.
+
+# --- patch the base image's OS packages -------------------------------------
 #
-#  1. The official LiteLLM image defines an ENTRYPOINT that runs the proxy and
-#     forwards CMD as arguments. If that holds, the CMD below appends
-#     `--config ... --port 4000` to it and the proxy starts with our config.
-#     If instead the base image's ENTRYPOINT ignores CMD, or there is no proxy
-#     ENTRYPOINT, this CMD will not take effect and the image will need an
-#     explicit ENTRYPOINT here instead. The owner MUST run the `docker inspect`
-#     command from the G1 report against the mirrored base image BEFORE
-#     building, and convert this to an ENTRYPOINT override if the inspection
-#     shows CMD is not forwarded to the proxy.
-#  2. The base image already contains the proxy entrypoint and runs as a
-#     non-root user by default (the upstream image is documented to). This
-#     Dockerfile does NOT set USER, so it inherits whatever the base image
-#     chose; if the inspection shows it runs as root, add a non-root USER here.
-#     readonlyRootFilesystem is enforced at the task level with a writable /tmp
-#     volume regardless (see terraform/app/gateway.tf).
+# WHY this layer exists: the base is Wolfi, and the image's installed packages
+# lag its own repositories. On v1.103.0 that left glibc, ld-linux, libcrypt1 and
+# zlib on versions with known CVEs (a High container-remediation finding), with
+# nowhere to move to: v1.103.0 is the newest stable LiteLLM and its digest has
+# not been rebuilt. Patching here is the remediation that does not wait on the
+# vendor.
 #
+# TWO traps, both found by measuring rather than reading, and both silent:
 #
-# INSPECTED (litellm v1.103.0, docker inspect): ENTRYPOINT
-# ["docker/prod_entrypoint.sh"], CMD ["--port","4000"], USER "root". So the
-# proxy ENTRYPOINT exists and takes CMD as arguments (assumption 1 holds in
-# shape; whether the script forwards "$@" verbatim is proven by the local boot
-# test, not by reading), and the base image runs as ROOT (assumption 2 was
-# wrong), hence the USER below.
+#  1. The image ships a STALE package index, so `apk` reports everything as
+#     current until `apk update` runs. Without the refresh this layer would
+#     report success and change nothing.
+#  2. `/etc/apk/world` PINS exact versions (`glibc-2.44=2.44-r1`, `zlib=1.3.2-r5`
+#     and so on -- the Chainguard build convention for reproducibility), and
+#     `apk upgrade` honours those pins. With a fresh index but the pins left in
+#     place, apk still reported "OK" and upgraded nothing. The pins have to be
+#     removed for the packages being patched.
+#
+# WHY a named list rather than unpinning everything: a blanket unpin pulls in
+# `openssl-4.0`, which fails the build with
+# `trying to overwrite etc/ssl/openssl.cnf owned by openssl-3.6.4` -- a major
+# openssl alongside a Python built against 3.6 is a bigger change than this
+# finding warrants. The list below is exactly the packages the advisory named, so
+# openssl stays where the vendor put it. The cost is maintenance: a future CVE in
+# some other package needs this list extended, and the guard below is what turns
+# a stale list into a loud build failure instead of a quiet no-op.
+#
+# Runs as root because apk writes under /usr and /lib; the USER directive below
+# returns the runtime to an unprivileged uid, so nothing in the running container
+# keeps the privilege this build step needed.
+USER root
+RUN set -eu; \
+    apk update; \
+    for p in glibc-2.44 glibc-2.44-locale-posix ld-linux-2.44 libcrypt1-2.44 zlib; do \
+        grep -qE "^${p}(=|$)" /etc/apk/world || { \
+            echo "ERROR: ${p} is no longer in /etc/apk/world -- the base image changed;" >&2; \
+            echo "re-check this package list against the current advisory." >&2; \
+            exit 1; \
+        }; \
+        sed -i "s/^${p}=.*$/${p}/" /etc/apk/world; \
+    done; \
+    apk upgrade --no-cache; \
+    rm -rf /var/cache/apk/*
 
 # Run as an unprivileged uid, the same one the gate uses. A numeric uid needs no
 # /etc/passwd entry. HOME points at the one writable path: the task runs with a

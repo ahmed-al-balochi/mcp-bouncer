@@ -381,3 +381,59 @@ def test_alb_log_bucket_blocks_all_public_access():
         assert re.search(rf"{switch}\s*=\s*true", block), (
             f"{switch} must be true so the ALB log bucket is not public (D7.2)"
         )
+
+
+# --- gateway/Dockerfile -----------------------------------------------------
+
+
+def test_gateway_image_patches_its_base_os_packages():
+    """The thin gateway image must refresh the index and upgrade OS packages.
+
+    The Wolfi base ships packages behind its own repositories, and the LiteLLM
+    version cannot be bumped past the newest stable, so the only remediation for
+    an OS CVE in the base is to patch it in this layer. Two things are asserted
+    rather than one: that the upgrade happens at all, and that `apk update`
+    precedes it -- the image carries a stale package index, so an upgrade without
+    the refresh reports everything as current and patches nothing, which is a
+    silent failure that would leave the CVEs in place while looking fixed.
+    """
+    # Strip comments first. The reasoning above these directives mentions both
+    # commands in prose, so searching the raw file would match the explanation
+    # rather than the instruction -- a mutation that deleted the real `apk update`
+    # left this test green until the comments were excluded.
+    text = "\n".join(
+        line
+        for line in (REPO_ROOT / "gateway" / "Dockerfile").read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    update = text.find("apk update")
+    upgrade = text.find("apk upgrade")
+    unpin = text.find("/etc/apk/world")
+    assert update != -1, "gateway/Dockerfile must run `apk update`"
+    assert upgrade != -1, "gateway/Dockerfile must run `apk upgrade`"
+    assert update < upgrade, (
+        "`apk update` must come before `apk upgrade`: without a fresh index the "
+        "upgrade silently patches nothing"
+    )
+    # The base image pins exact versions in /etc/apk/world and `apk upgrade`
+    # honours them, so without removing those pins the upgrade is a no-op that
+    # still reports success. Measured on the real base image, not inferred.
+    assert unpin != -1 and unpin < upgrade, (
+        "gateway/Dockerfile must unpin the affected packages in /etc/apk/world "
+        "before `apk upgrade`, or the upgrade patches nothing"
+    )
+
+
+def test_gateway_image_drops_back_to_the_unprivileged_uid():
+    """Patching needs root at build time; the runtime must not keep it.
+
+    Guards the ordering: the last USER directive in the file has to be the
+    unprivileged one, so a future edit that adds another root step at the end
+    cannot leave the container running as root.
+    """
+    text = (REPO_ROOT / "gateway" / "Dockerfile").read_text()
+    users = re.findall(r"^USER\s+(\S+)", text, re.MULTILINE)
+    assert users, "gateway/Dockerfile must set USER"
+    assert users[-1].startswith("10001"), (
+        f"the final USER must be the unprivileged uid, found {users[-1]!r}"
+    )

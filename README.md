@@ -282,6 +282,11 @@ build-arg — the `gateway/Dockerfile` has no default for it, so a build must na
 the mirrored LiteLLM image explicitly (ideally by digest), which is what pins the
 LiteLLM version. The version this was built and inspected against is LiteLLM
 `1.103.0`, whose upstream public image is `ghcr.io/berriai/litellm:v1.103.0`.
+The build also refreshes the base image's package index and upgrades its OS
+packages, because the Wolfi base ships packages behind its own repositories; see
+the reasoning in `gateway/Dockerfile`. Rebuilding is therefore how the image
+stays patched, and two builds from the same base digest can differ in patch
+level.
 Mirror that image into your own registry (public pulls are the base image's own
 rate limits and availability, not something this repo controls) and pass the
 mirrored reference — this repo does not ship or select the base image for you:
