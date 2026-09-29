@@ -14,7 +14,17 @@ defaults:
 
 limits:
   # Approved destructive actions allowed per caller per rolling hour. Beyond
-  # this, destructive calls are blocked until a human runs `gate reset <caller>`.
+  # this, destructive calls are blocked until a human runs `bouncer reset <caller>`.
+  #
+  # Best-effort under concurrency, on purpose: the gate counts a caller's
+  # approved releases in the window and decides before it records the current
+  # release, so several distinct approved grants fired at once can each read a
+  # stale count and overshoot a cap smaller than their number. This throttles
+  # human-approved work per evaluation, not a hard ceiling across simultaneous
+  # evaluations -- acceptable because every destructive call is already gated by
+  # a human approval upstream. The one-shot per-grant guarantee is unaffected: a
+  # grant still releases exactly once. See DESIGN.md ("best-effort under
+  # concurrency") for why the cap is not made atomic.
   destructive_per_hour: 3
   # How long an approval stays usable. It is still one-shot within that window.
   approval_ttl_minutes: 10

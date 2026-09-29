@@ -200,20 +200,45 @@ not a duplicate release — and it cannot weaken the one-shot guarantee, which
 rests on the conditional delete of the *grant*, not on pending dedup. It is
 already commented at the point it happens.
 
-**There is an SDK-retry case where the true winner is told no.** The rate check
-runs before the grant claim. In a burst of identical concurrent retries, one
-claim wins and releases the call, which counts against the caller's rolling-hour
-destructive cap; later evaluations in the same burst can then see the cap reached
-and block. So the safe direction is chosen twice over: the system over-denies
-(a caller at its cap is refused) but never double-releases (the one-shot claim
-still admits exactly one). This was observed live — one grant, ten concurrent
-retries, one released and nine parked or blocked — and separately at the store
-level with twenty independent OS processes racing one grant on the real table,
-one winner each of three runs. Both runs drove their clients from a single
+**The destructive rate cap is best-effort under concurrency, and that is a
+deliberate choice.** The cap has a genuine time-of-check-to-time-of-use gap.
+Reading the code: `middleware._evaluate` counts the caller's approved releases
+in the rolling window (`gate/middleware.py:115`, calling `approved_in_window`)
+and then decides against that count (`gate/middleware.py:119`, where
+`policy.decide` applies the `approved_destructive_in_window >=
+destructive_per_hour` test at `gate/policy.py:100`) — *before* it records the
+current release, which happens only when the grant is claimed at
+`gate/middleware.py:126` (`consume`, whose `INSERT INTO releases` at
+`gate/approvals.py:276` is exactly what `approved_in_window` counts). So N
+approved grants for the same caller, fired concurrently, each read a window count
+that does not yet include the others' releases; each can pass the cap check on
+that stale count, and the caller can overshoot a cap smaller than N. The window
+is small — the read, the decision and the claim are close together — but it is
+real, so the cap is a throttle enforced *per evaluation*, not a hard ceiling
+across simultaneous evaluations.
+
+What the cap *does* guarantee is unchanged: it throttles **human-approved**
+destructive work, because every destructive call has already been parked and
+released by a human before it can count against the cap at all — the cap stands
+between an operator and approving too much, not between an agent and damage. What
+it does *not* guarantee is a hard ceiling when several distinct approved grants
+race. The accepted trade, per the owner: closing the gap means moving the count
+into the conditional claim in `consume()` — the one piece that is airtight and
+proven live to release exactly once — and a bug there would cost the one-shot
+guarantee, which is the property the whole design rests on. Trading an
+exploitable double-release for a soft cap on already-approved work is the wrong
+direction, so the cap is documented as best-effort rather than made atomic.
+
+**None of this touches the one-shot per-grant guarantee.** That guarantee is a
+property of the *claim*, not the count: the conditional delete admits exactly one
+release per grant even under concurrency, so a cap overshoot means "more approved
+grants ran this hour than the cap nominally allows", never "one grant released
+twice". This was observed live from both directions — one grant, ten concurrent
+identical retries, one released and the rest parked or blocked; and separately at
+the store level with twenty independent OS processes racing one grant on the real
+table, one winner each of three runs. Both runs drove their clients from a single
 laptop, so this is multi-client evidence, not multi-host; the cross-host claim
-still rests on the conditional-delete being a single atomic DynamoDB operation.
-It is worth keeping as an example of preferring the refusal that costs a retry
-over the release that costs a guarantee.
+still rests on the conditional delete being a single atomic DynamoDB operation.
 
 ## The LLM gateway
 
@@ -286,6 +311,64 @@ an agent that forgets its header is refused rather than silently defaulted to a
 working credential — fail closed, not fail open. A missing gate token therefore
 fails closed but *silently*: the gate returns 401, LiteLLM drops the tools, and
 the model answers as if it never had them.
+
+**LiteLLM is inside the gate's identity trust boundary — the finding worth the
+whole security pass.** Because each agent forwards its *own* gate token through
+LiteLLM on every request (`x-mcp-bouncer-authorization` in
+`gateway/litellm.yaml`'s `mcp_servers.bouncer` and in `demo/llm_agent.py`), the
+gate re-resolves the caller's identity from that forwarded header on each call
+(`gate/middleware.py` opts `authorization` back into the headers it hands the
+resolver; `gate/identity.py` maps the bearer token to a caller and team), and the
+Service Connect hop from LiteLLM to the gate is **plain HTTP on port 8000 with no
+TLS** (`terraform/app/ecs.tf`, addressed as `http://gate:8000/mcp`). LiteLLM
+therefore sees every caller's gate token in clear. The consequence is sharper
+than the shared-master-key limitation stated earlier: that says only that
+*model* calls are unattributable per agent. This says that a compromise of
+the LiteLLM task means the ability to **impersonate any caller to the gate**,
+because the attacker holds every caller's tool credential — the per-agent
+identity that survives for tool calls is only as trustworthy as the gateway that
+relays it. The real fixes both have real costs. A **trusted identity header** —
+LiteLLM asserting the caller identity and the gate trusting it — needs a gate
+change *and* a proof that only LiteLLM can reach the gate; the security group
+already gives the latter (the gate admits port 8000 from the LiteLLM security
+group alone, R52), so this is the smaller of the two once the gate learns to
+trust a header. **Per-agent virtual keys** would let LiteLLM bind each agent to
+its own credential, but they need LiteLLM's database — the Postgres the lean POC
+deliberately left out. Neither is built; the boundary is stated so a reader knows
+exactly what a gateway compromise buys.
+
+**Five more accepted-and-documented boundaries, none fixed for the POC.** The
+audit log is append-only *against the workload* — structurally (no update/delete
+path), by the task role's `PutItem`+`Query` IAM, and by the DynamoDB endpoint
+policy's own statement — but **not against a principal using the account's own
+credentials from outside the VPC**: an endpoint policy binds only traffic that
+traverses the endpoint, so a laptop with the right IAM rights reaches the table
+directly and the endpoint constraint never applies. The production answer is a
+separate log-archive account the workload account cannot write over, which is out
+of scope here. The **HTTPS listener sets no HSTS**: the `:443` listener
+(`terraform/app/alb.tf`) terminates TLS and the `:80` listener 301-redirects to
+it, but no `Strict-Transport-Security` response header is emitted, so a client
+that first speaks plain HTTP is not told to pin HTTPS for future requests. Low
+risk here — the allowlist means the one caller is the operator and the redirect
+already upgrades the connection — but named rather than implied. **Unauthenticated
+requests generate attacker-drivable auth-rejection log volume**: every call the
+gate refuses before classification writes an operational log line and a
+best-effort audit line (`gate/middleware.py` `on_call_tool`, the
+`AuthenticationError` branch calling `observability.log_auth_rejected` and
+`_audit_best_effort`), so anyone who can reach the gate can inflate log volume
+without ever authenticating. It leaks nothing (the line carries a fixed reason
+and never a token) and the security group already limits who can reach port 8000
+to the LiteLLM task, so the exposure is bounded; it is named because log-volume
+cost is not zero. The **argument hash binds the wire representation, not semantic
+equivalence**: it is `sha256` over the canonical JSON of the arguments, so two
+requests that mean the same thing but serialise differently hash differently and
+would each need their own approval — it **fails safe** (it can over-park, forcing
+a second approval, never under-park into releasing a call the human did not see).
+And approve-time versus consume-time **clock skew shifts the effective TTL
+window**: the TTL is stamped when the call is parked and evaluated when the grant
+is read, so skew between whichever hosts do each can lengthen or shorten the real
+usable window by that skew — bounded and small in one region, worth naming rather
+than implying the window is exact.
 
 **The preflight exists because that silent drop can be actively misleading.** In
 a live run with its tools dropped, a model did not say it could not act — it

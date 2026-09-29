@@ -29,6 +29,7 @@ APP_TF_DIR = REPO_ROOT / "terraform" / "app"
 VARIABLES_TF = APP_TF_DIR / "variables.tf"
 ECS_TF = APP_TF_DIR / "ecs.tf"
 ALB_TF = APP_TF_DIR / "alb.tf"
+ACCESS_LOGS_TF = APP_TF_DIR / "access_logs.tf"
 
 
 def _load_config() -> dict:
@@ -294,4 +295,89 @@ def test_gateway_rule_does_not_open_tools_call():
     for v in values:
         assert "tools/call" not in v, (
             f"gateway rule path {v!r} opens tools/call; it must stay 404 (D6.22)"
+        )
+
+
+# --- ALB access logs to S3 (D7.2) ------------------------------------------
+
+
+def _alb_resource_block(text: str) -> str:
+    """Return the body of the `aws_lb "this"` block from alb.tf.
+
+    Same brace-matched slice technique as the other block helpers here: from the
+    resource header to its matching close brace, so the nested access_logs block
+    is included. Not a full HCL parser; its limit is that a stray brace inside a
+    string literal would miscount, which this block does not contain (terraform
+    fmt normalises it and its strings are simple scalars).
+    """
+    header = re.search(r'resource\s+"aws_lb"\s+"this"\s*\{', text)
+    assert header, 'aws_lb "this" not found in alb.tf'
+    depth = 0
+    start = header.end() - 1
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise AssertionError("unbalanced braces parsing the aws_lb block")
+
+
+def test_alb_has_access_logs_enabled():
+    """D7.2: the ALB writes access logs to S3, and the block is enabled.
+
+    Asserts the `aws_lb "this"` resource carries an `access_logs` block whose
+    `enabled` is `true`. Limit: a text/brace parse of the committed HCL, not a
+    plan -- it proves the block was written with enabled = true, not that AWS
+    accepted it at apply (the phase-8 apply is that test). It deliberately does
+    not pin the bucket/prefix values, only that logging is turned on, so a rename
+    of the bucket resource does not break this guard.
+    """
+    block = _alb_resource_block(ALB_TF.read_text())
+    logs = re.search(r"access_logs\s*\{(.*?)\}", block, re.S)
+    assert logs, "the ALB has no access_logs block (D7.2)"
+    assert re.search(r"enabled\s*=\s*true", logs.group(1)), (
+        "the ALB's access_logs block must set enabled = true (D7.2)"
+    )
+
+
+def test_alb_log_bucket_blocks_all_public_access():
+    """D7.2: the access-log bucket is not public.
+
+    The bucket holds request metadata (source IPs, paths), so it must never be
+    internet-readable. Asserts an `aws_s3_bucket_public_access_block` exists for
+    the log bucket with all four switches set true. Limit: a text scan of
+    access_logs.tf; it checks the four literals are present and true, not the
+    live bucket ACL/policy state (again, apply-time). It keys off the resource
+    name `alb_logs` this change introduces.
+    """
+    text = ACCESS_LOGS_TF.read_text()
+    header = re.search(
+        r'resource\s+"aws_s3_bucket_public_access_block"\s+"alb_logs"\s*\{', text
+    )
+    assert header, (
+        "no aws_s3_bucket_public_access_block for the ALB log bucket (D7.2)"
+    )
+    # Slice to the block's close brace so we only read this resource's switches.
+    depth = 0
+    start = header.end() - 1
+    block = ""
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                block = text[start : i + 1]
+                break
+    assert block, "unbalanced braces parsing the public_access_block resource"
+    for switch in (
+        "block_public_acls",
+        "block_public_policy",
+        "ignore_public_acls",
+        "restrict_public_buckets",
+    ):
+        assert re.search(rf"{switch}\s*=\s*true", block), (
+            f"{switch} must be true so the ALB log bucket is not public (D7.2)"
         )

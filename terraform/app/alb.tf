@@ -20,6 +20,27 @@ resource "aws_lb" "this" {
   # tool rounds can exceed the 60 s default. Not measured; set pre-emptively.
   idle_timeout = 300
 
+  # ALB access logs to S3 (D7.2, owner's choice for platform visibility). The
+  # ALB's automatic CloudWatch metrics are per-minute COUNTS (RequestCount,
+  # HTTPCode_ELB_4XX_Count) -- they say THAT something happened; access logs are
+  # one line per request with source IP, path, status and latency -- they say WHO
+  # and WHAT. Only the log can reconstruct an incident, and the gate's own audit
+  # log cannot substitute: it records tool DECISIONS, and only for calls that
+  # reached the gate through LiteLLM, so everything the ALB 404s or rejects is
+  # invisible to it. The bucket and its policy live in access_logs.tf; the
+  # dependency on the policy is explicit there so the ALB's own write-test at
+  # enable time cannot race the policy attachment.
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.id
+    prefix  = local.alb_log_prefix
+    enabled = true
+  }
+
+  # The ALB validates the bucket policy by writing a test object when access
+  # logs are enabled; without this the policy PutObject grant can be created
+  # after the load balancer tries its write, failing the apply.
+  depends_on = [aws_s3_bucket_policy.alb_logs]
+
   tags = { Name = "${var.project_name}-alb" }
 }
 

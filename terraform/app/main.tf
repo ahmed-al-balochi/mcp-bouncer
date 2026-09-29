@@ -23,6 +23,13 @@ locals {
   # the only host the ALB answers. Built once here.
   gateway_host = "${var.gateway_host_label}.${var.dns_zone_name}"
 
+  # Key prefix under which the ALB writes access logs (D7.2). A prefix (rather
+  # than the bucket root) keeps the ELB-owned `AWSLogs/<account>/...` tree under
+  # one namespace, so the bucket could later hold other logs without collision,
+  # and it makes the bucket-policy resource ARN specific. It must NOT contain the
+  # string "AWSLogs" (an ELB constraint) -- it does not.
+  alb_log_prefix = "alb"
+
   # Container/target port. The image EXPOSEs 8000 and binds 0.0.0.0:8000
   # (--port 8000); the target group and SG rules all key off this one value.
   container_port = 8000

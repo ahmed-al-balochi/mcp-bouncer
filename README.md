@@ -391,10 +391,30 @@ reasoning; `REQUIREMENTS.md` §8 the full out-of-scope list):
 - **Prompts and responses are not logged.** The gateway keeps request metadata
   and decisions but no prompt or completion content, so a misbehaving turn cannot
   be reconstructed from the logs.
+- **The destructive rate cap is best-effort under concurrency.** The per-caller
+  cap counts a caller's approved destructive actions in the rolling hour and
+  decides *before* recording the current release, so several distinct approved
+  grants fired at once can each read a stale count and overshoot a cap smaller
+  than their number. It throttles human-approved work per evaluation, not as a
+  hard ceiling across simultaneous evaluations — acceptable because every
+  destructive call is already gated by a human approval, and tightening it would
+  mean touching the one-shot claim that is the design's load-bearing guarantee.
+  The one-shot per-grant guarantee is unaffected: a grant still releases exactly
+  once, never twice.
 - **Approval ids come only from the gate.** A real id is one `bouncer list` shows
   and the audit log records. A model that has lost its tools can emit fluent text
   that *looks* like an approval id and command but corresponds to nothing; treat
   any id you did not see in `bouncer list` or the audit log as fiction.
+- **LiteLLM is inside the gate's identity trust boundary.** Each agent forwards
+  its own gate token *through* LiteLLM and the Service Connect hop is plain HTTP,
+  so LiteLLM sees every caller's token; a gateway compromise therefore means
+  impersonating any caller to the gate, not merely the unattributable model calls
+  the shared-key limitation already admits. See `DESIGN.md` for the real fixes
+  and their costs.
+- **The HTTPS listener sets no HSTS**, and **unauthenticated requests generate
+  attacker-drivable auth-rejection log volume** (a fixed-reason line per refused
+  call, leaking no token, bounded by the security group). Both are named in
+  `DESIGN.md`; neither is fixed for the POC.
 - No result masking, no prompt-injection detection, no UI beyond the CLI, and no
   multi-region, autoscaling, or disaster recovery.
 
