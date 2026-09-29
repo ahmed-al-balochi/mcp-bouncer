@@ -166,7 +166,12 @@ gate/
   middleware.py     the single on_call_tool hook
   server.py         the FastMCP proxy and the health endpoint
   cli.py            bouncer list | approve | deny | reset | log
-demo/               a toy upstream MCP server and a minimal client
+demo/
+  wiki_server.py    a toy upstream MCP server
+  agent.py          a minimal MCP client for the no-AWS local demo
+  llm_agent.py      the real deployed path: a one-shot LLM agent that drives the
+                    gate through the LiteLLM gateway (needs the llm-demo extra)
+gateway/            the thin LiteLLM gateway image (litellm.yaml + Dockerfile)
 terraform/          infrastructure, split into a bootstrap stack and an app stack
 policy.yaml         the rules
 ```
@@ -191,11 +196,213 @@ policy.yaml         the rules
   and tests stay offline; DynamoDB is selected by one environment variable and the
   middleware never learns which it holds.
 
-## Status
+## Deploy it
 
-The component, its test suite and the DNS and image infrastructure are done. The
-application infrastructure — load balancer, container service, tables, secrets —
-and the deployment walkthrough are in progress, as is a fuller design document.
+The local demo needs no AWS. This section takes you from a clone to a running
+deployment: the LiteLLM gateway behind an ALB on your own domain, the gate
+private behind it, models pinned to the EU, and the approval loop driven by a
+real model. `DESIGN.md` explains *why* each piece is shaped this way; this is the
+walkthrough.
+
+Every value below is derived from `terraform output` rather than pasted, so
+nothing in these commands is specific to one account. Run the app-stack outputs
+from `terraform/app` and the bootstrap outputs from `terraform/bootstrap`.
+
+You need: an AWS account with Bedrock access to the EU Claude inference profile
+enabled, the AWS CLI authenticated, Terraform, Docker, and a domain you can add
+DNS records to. All values that describe *your* account live in a gitignored
+`terraform.tfvars`; copy the committed `terraform.tfvars.example` in each stack
+and fill in your own.
+
+### 1. Bootstrap (applied once, never destroyed)
+
+The bootstrap stack creates the DNS zone, the TLS certificate, and the two ECR
+repositories. It is separate from the app stack because these must survive a
+teardown — the zone's name servers are what your registrar delegates to, and the
+images must outlive `terraform destroy`.
+
+```bash
+cd terraform/bootstrap
+cp terraform.tfvars.example terraform.tfvars   # then edit: aws_region, dns_zone_name
+terraform init
+terraform apply
+```
+
+### 2. Delegate the zone at your registrar
+
+This step is manual and only you can do it. The bootstrap stack created a
+delegated zone; point your registrar at its name servers:
+
+```bash
+terraform output name_servers
+```
+
+At your existing registrar, add one `NS` record per entry, all with the
+subdomain label as the record name. Do **not** change your domain's own name
+servers — that would move the whole domain. Once delegation is live, ACM finishes
+validating the certificate on its own; check it with:
+
+```bash
+eval "$(terraform output -raw certificate_status_check)"   # prints ISSUED when ready
+```
+
+Wait for `ISSUED` before applying the app stack — it looks the certificate up
+filtered to that status and fails fast otherwise.
+
+### 3. Build and push both images
+
+Two images, two repositories. Log in to ECR first (both repos are in the same
+registry):
+
+```bash
+GATE_REPO=$(terraform output -raw ecr_repository_url)
+LITELLM_REPO=$(terraform output -raw ecr_litellm_repository_url)
+REGION=$(echo "$GATE_REPO" | cut -d. -f4)   # region is embedded in the ECR URL
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "${GATE_REPO%%/*}"
+```
+
+Both builds target the architecture the task definition asks for
+(`cpu_architecture`, `X86_64` by default). If you build with buildx and push in
+one step, pass `--provenance=false --sbom=false`: without them buildx pushes an
+image *index* plus untagged child manifests, the tag points at the index, and a
+lifecycle policy that expires untagged images can leave the tag referencing
+nothing.
+
+The **gate** image builds from the repository root:
+
+```bash
+cd ../..                       # repo root
+docker build --platform linux/amd64 -t "$GATE_REPO:latest" .
+docker push "$GATE_REPO:latest"
+```
+
+The **gateway** image builds from `gateway/` and requires a base image
+build-arg — the `gateway/Dockerfile` has no default for it, so a build must name
+the mirrored LiteLLM image explicitly (ideally by digest), which is what pins the
+LiteLLM version. The version this was built and inspected against is LiteLLM
+`1.103.0`, whose upstream public image is `ghcr.io/berriai/litellm:v1.103.0`.
+Mirror that image into your own registry (public pulls are the base image's own
+rate limits and availability, not something this repo controls) and pass the
+mirrored reference — this repo does not ship or select the base image for you:
+
+```bash
+cd gateway
+docker build --platform linux/amd64 \
+  --build-arg LITELLM_BASE_IMAGE=<your mirror of ghcr.io/berriai/litellm:v1.103.0> \
+  -t "$LITELLM_REPO:latest" .
+docker push "$LITELLM_REPO:latest"
+cd ..
+```
+
+### 4. Apply the app stack
+
+```bash
+cd terraform/app
+cp terraform.tfvars.example terraform.tfvars   # then edit: aws_region, dns_zone_name, alert_email
+terraform init
+terraform apply
+```
+
+With `allowed_cidrs` left unset, the ALB is opened only to the public IP of the
+machine you apply from. `alert_email` receives the `fail_closed` alarm via SNS —
+AWS emails a confirmation link you must click before any alarm is delivered. See
+`terraform output allowed_cidrs_effective` to confirm what was allowed.
+
+### 5. Fetch the credentials
+
+None of these are Terraform outputs in plaintext — the outputs emit the commands
+that fetch them from Secrets Manager, so a token never lands in state output:
+
+```bash
+# The LiteLLM master key (the agent's model-call credential):
+eval "$(terraform output -raw litellm_master_key_get_command)"
+
+# The bearer tokens (token -> caller/team map); pick your caller's token:
+eval "$(terraform output -raw tokens_get_command)"
+```
+
+Export what the demo agent reads. `BOUNCER_GATEWAY_KEY` is the master key above,
+`BOUNCER_DEMO_TOKEN` is one caller's gate token from the map:
+
+```bash
+export BOUNCER_GATEWAY_URL=$(terraform output -raw gateway_openai_base_url)
+export BOUNCER_GATEWAY_KEY=<the master key from above>
+export BOUNCER_DEMO_TOKEN=<a gate token from the map above>
+```
+
+### 6. Run the model-driven loop
+
+`demo/llm_agent.py` is the real deployed path: it calls the gateway's
+OpenAI-compatible API with the `bouncer` MCP tool and forwards its own gate
+token. It needs the `llm-demo` extra, and the operator commands below need the
+`aws` extra for boto3, so install both: `pip install -e '.[aws,llm-demo]'`. Each
+run is a fresh single-turn conversation, so "retry after approval" is simply
+running the same prompt again.
+
+```bash
+# A read passes:
+python -m demo.llm_agent "Read the wiki page titled home and tell me what it says."
+
+# A destructive call parks; the model relays the approval id and command verbatim:
+python -m demo.llm_agent "Delete the wiki page titled home."
+```
+
+Approve from the CLI, against the deployed DynamoDB store, from this same laptop.
+Export the operator environment the output emits, then approve the id the model
+reported:
+
+```bash
+export $(terraform output -raw operator_cli_env)
+bouncer list
+bouncer approve <id>
+```
+
+Re-run the identical delete prompt: the model retries with the same arguments and
+the call is released exactly once. A third identical run parks again. Approval ids
+come only from `bouncer list` or the audit log — never from the model's text (see
+the limitations below).
+
+### 7. Tear down
+
+```bash
+cd terraform/app
+terraform destroy
+```
+
+`terraform destroy` on the app stack leaves nothing running that costs money. The
+bootstrap stack is left in place on purpose, so the delegation and images survive.
+
+## Known limitations
+
+Stated plainly rather than left to be discovered (`DESIGN.md` covers the
+reasoning; `REQUIREMENTS.md` §8 the full out-of-scope list):
+
+- **Approver authorisation is not built.** Anyone who can reach the store can
+  approve a parked call.
+- **The gateway key is shared.** LiteLLM runs without a database, so its master
+  key is also its admin key; every agent uses it for model calls. Model calls
+  carry no per-agent attribution and there are no per-agent budgets or model
+  allowlists. Per-agent identity survives only for *tool* calls, through the gate
+  tokens.
+- **Token rotation needs a restart.** The gate reads its token table once at
+  boot, so a rotated token does not take effect until the task recycles — until
+  then a freshly minted token is rejected.
+- **Prompts and responses are not logged.** The gateway keeps request metadata
+  and decisions but no prompt or completion content, so a misbehaving turn cannot
+  be reconstructed from the logs.
+- **Approval ids come only from the gate.** A real id is one `bouncer list` shows
+  and the audit log records. A model that has lost its tools can emit fluent text
+  that *looks* like an approval id and command but corresponds to nothing; treat
+  any id you did not see in `bouncer list` or the audit log as fiction.
+- No result masking, no prompt-injection detection, no UI beyond the CLI, and no
+  multi-region, autoscaling, or disaster recovery.
+
+## Design
+
+See `DESIGN.md` for the reasoning behind classification-by-reversibility, the
+identity-by-transport decision, the storage port, the three EU-only layers, and
+the deployment shape. This README does not repeat it.
 
 ## Not built, on purpose
 

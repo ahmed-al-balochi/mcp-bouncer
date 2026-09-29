@@ -4,7 +4,7 @@ The contract for this project. Implementer agents build against it; the reviewer
 agent checks work against it. If a requirement here is wrong, fix it here first
 rather than deviating in code.
 
-Status: DRAFT — awaiting owner sign-off.
+Status: Approved by the owner, including the §4.5 LLM gateway amendment.
 
 ---
 
