@@ -16,27 +16,23 @@ locals {
       x      = 0
       y      = 46
       width  = 24
-      height = 2
+      height = 1
       properties = {
-        markdown = <<-EOT
-        ## Service levels — targets are **illustrative for a demo workload**; the two latency targets are **PROVISIONAL** and will be replaced by a measured baseline from the live run.
-        Each SLI draws its target as a horizontal annotation. Attainment over the viewed range is shown as a single value where CloudWatch can express it.
-        EOT
+        markdown = "## Service levels"
       }
     },
 
     # --- Gateway availability = 1 - (Target_5XX + ELB_5XX)/RequestCount -------
-    # Drawn as a percentage time series with the 99.5% target annotation, plus a
-    # single-value attainment over the range. All error inputs FILLed so a
-    # healthy stack computes 100%, not "no data".
+    # Drawn as a percentage time series with the 99.5% target annotation. All
+    # error inputs FILLed so a healthy stack computes 100%, not "no data".
     {
       type   = "metric"
       x      = 0
-      y      = 48
+      y      = 47
       width  = 12
       height = 6
       properties = {
-        title  = "SLI — gateway availability (%)"
+        title  = "Gateway availability (%)"
         region = local._r
         view   = "timeSeries"
         yAxis  = { left = { min = 90, max = 100 } }
@@ -53,35 +49,17 @@ locals {
         }
       }
     },
-    {
-      type   = "metric"
-      x      = 12
-      y      = 48
-      width  = 6
-      height = 6
-      properties = {
-        title  = "Availability attainment (range)"
-        region = local._r
-        view   = "singleValue"
-        metrics = [
-          [{ expression = "100 * (1 - (FILL(sv_t5,0) + FILL(sv_e5,0)) / IF((FILL(sv_rc,0)) > 0, FILL(sv_rc,0), 1))", label = "availability %", id = "sv" }],
-          ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", local.alb_arn_suffix, "TargetGroup", local.litellm_tg_arn_suffix, { id = "sv_t5", stat = "Sum", visible = false }],
-          ["AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", local.alb_arn_suffix, { id = "sv_e5", stat = "Sum", visible = false }],
-          ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", local.alb_arn_suffix, { id = "sv_rc", stat = "Sum", visible = false }],
-        ]
-      }
-    },
 
     # --- Gateway end-to-end latency p95 (ALB TargetResponseTime) -------------
     # PROVISIONAL 30 s target as an annotation.
     {
       type   = "metric"
-      x      = 18
-      y      = 48
-      width  = 6
+      x      = 12
+      y      = 47
+      width  = 12
       height = 6
       properties = {
-        title  = "SLI — gateway latency p95 (s)"
+        title  = "Gateway latency p95 (s)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -103,11 +81,11 @@ locals {
     {
       type   = "metric"
       x      = 0
-      y      = 54
+      y      = 53
       width  = 18
       height = 6
       properties = {
-        title  = "SLI — error rate by class (% of requests)"
+        title  = "Error rate by class (%)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -142,11 +120,11 @@ locals {
     {
       type   = "metric"
       x      = 18
-      y      = 54
+      y      = 53
       width  = 6
       height = 6
       properties = {
-        title  = "SLI — model latency p95 (ms)"
+        title  = "Model latency p95 (ms)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -166,11 +144,11 @@ locals {
     {
       type   = "metric"
       x      = 0
-      y      = 60
+      y      = 59
       width  = 12
       height = 6
       properties = {
-        title  = "SLI — output:input token ratio (no target — needs history this demo lacks)"
+        title  = "Token ratio (no target yet)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -188,11 +166,11 @@ locals {
     {
       type   = "metric"
       x      = 12
-      y      = 60
+      y      = 59
       width  = 12
       height = 6
       properties = {
-        title  = "SLI — gate fail-closed rate per team (%)"
+        title  = "Fail-closed rate per team (%)"
         region = local._r
         view   = "timeSeries"
         metrics = concat(
@@ -231,23 +209,19 @@ locals {
     {
       type   = "text"
       x      = 0
-      y      = 66
+      y      = 65
       width  = 24
-      height = 6
+      height = 5
       properties = {
         markdown = <<-EOT
-        ## What is deliberately absent, and why
+        ## Not measured, and why
+        - **Time to first token**: Bedrock is called non-streaming, so it is never emitted.
+        - **Fallback engagement**: one model, no fallback.
+        - **Cache hit rate**: no prompt caching.
+        - **Cost in currency**: would hardcode a price; token counts are shown instead.
+        - **Token ratio target**: a normal band needs history this demo lacks.
 
-        Model-call indicators above are **platform-wide, not per team**: without per-agent gateway keys a model call carries no team identity, so Bedrock usage cannot be attributed to a team (R60). Tool-call governance *is* per team, from the gate's decision log.
-
-        Indicators intentionally **not shown**, because the deployment cannot measure them honestly (R61):
-
-        - **Time to first token** — the gateway calls Bedrock non-streaming, so `TimeToFirstToken` has never been emitted. Showing it would imply a streaming path that does not exist.
-        - **Fallback engagement** — there is one model and no fallback, so there is nothing to measure.
-        - **Cache hit rate** — no prompt caching is configured, so there are no cache hits or misses.
-        - **Cost in currency** — pricing would have to be hardcoded (no live price feed in the no-internet VPC, and a hardcoded rate would silently go stale). Input/output **token counts** are shown instead, from which cost can be derived out of band.
-
-        Alarms are deliberately limited to the single **fail-closed** alarm; these widgets are for observation, not paging (REQUIREMENTS §8).
+        Model rows are platform-wide: without per-agent gateway keys a model call carries no team. Targets are illustrative; latency targets are provisional. The only alarm is fail-closed.
         EOT
       }
     },

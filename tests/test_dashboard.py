@@ -313,11 +313,11 @@ def test_token_ratio_sli_has_no_target_annotation():
     text = _strip_comments(_all_dashboard_text())
     # Locate the ratio SLI widget by its title and assert its slice has no
     # horizontal annotation. The widget title is distinctive.
-    m = re.search(r'title\s*=\s*"SLI — output:input token ratio[^"]*"', text)
+    m = re.search(r'title\s*=\s*"Token ratio[^"]*"', text)
     assert m, "the token-ratio SLI widget was not found by title"
     # Slice a window after the title up to the next widget title or end.
     after = text[m.end() :]
-    nxt = re.search(r'title\s*=\s*"SLI', after)
+    nxt = re.search(r'title\s*=\s*"', after)
     window = after[: nxt.start()] if nxt else after
     assert "horizontal" not in window, (
         "the output:input ratio SLI must not draw a target annotation (R59)"
@@ -523,8 +523,9 @@ def test_availability_formula_divides_5xx_by_request_count():
     arithmetically wrong. Checked on both the time-series and single-value forms.
     """
     text = _strip_comments(_all_dashboard_text())
-    # time series (av_*) and single value (sv_*).
-    for prefix in ("av", "sv"):
+    # The availability time series (av_*). The single-value attainment widget
+    # was removed at the owner's request.
+    for prefix in ("av",):
         pat = re.compile(
             rf"1\s*-\s*\(FILL\({prefix}_t5,0\)\s*\+\s*FILL\({prefix}_e5,0\)\)\s*/\s*"
             rf"IF\(\(FILL\({prefix}_rc,0\)\)\s*>\s*0",
@@ -586,7 +587,6 @@ def test_both_dynamodb_tables_and_both_services_are_referenced():
     # Per metric family, not anywhere in the text: a reference surviving in one
     # widget must not mask the same table or service vanishing from another.
     families = {
-        '"SuccessfulRequestLatency"': ("local.approvals_table", "local.audit_table"),
         '"ThrottledRequests"': ("local.approvals_table", "local.audit_table"),
         '"CPUUtilization"': ("local.gate_service_name", "local.litellm_service_name"),
         '"MemoryUtilization"': ("local.gate_service_name", "local.litellm_service_name"),
@@ -636,3 +636,26 @@ def test_no_max_of_a_series_and_a_scalar():
         "MAX([...]) mixing a series and a scalar is rejected by CloudWatch; "
         "floor with IF(x > 0, x, floor) instead"
     )
+
+
+def test_section_headers_are_four_words_or_fewer():
+    """Owner's rule: section headers are labels, four words at most.
+
+    The text widgets that open each row carry only a `## ` heading; longer prose
+    belongs in DESIGN.md, not on the dashboard.
+    """
+    raw = _all_dashboard_text_raw()
+    headers = re.findall(r"^\s*(?:markdown\s*=\s*\")?##\s+([^\"\n]+)", raw, re.M)
+    assert len(headers) >= 6, f"expected six section headers, found {headers!r}"
+    for header in headers:
+        words = header.replace(",", " ").split()
+        assert len(words) <= 4, f"section header too long ({len(words)} words): {header!r}"
+
+
+def test_no_widget_title_repeats_the_sli_label():
+    """Inside the service-levels section, "SLI" in a title is redundant."""
+    text = _strip_comments(_all_dashboard_text())
+    titles = re.findall(r'title\s*=\s*"([^"]*)"', text)
+    assert titles, "no widget titles found"
+    offenders = [t for t in titles if t.upper().startswith("SLI")]
+    assert not offenders, f"titles repeat the section label: {offenders!r}"

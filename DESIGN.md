@@ -408,11 +408,10 @@ It has four observation rows and an SLI row:
 - **Platform health.** Both Fargate services (CPU, memory, running task count),
   the ALB healthy-host count for the LiteLLM target group (the gate has none —
   it is internal-only), the Service Connect gate hop (requests, p95 response
-  time, 2xx/4xx/5xx), and both DynamoDB tables. DynamoDB latency and system
-  errors are published only on the `(TableName, Operation)` dimension pair, never
-  on `TableName` alone, so those widgets name the operations the store actually
-  issues (`GetItem`/`PutItem`/`Query`/`DeleteItem`), per the DynamoDB metrics
-  documentation.
+  time, 2xx/4xx/5xx), and throttles and system errors on both DynamoDB tables.
+  System errors are published only on the `(TableName, Operation)` dimension
+  pair, never on `TableName` alone, so that series names an operation the store
+  actually issues, per the DynamoDB metrics documentation.
 - **Gateway traffic.** ALB request count, target response time p50/p95, and the
   4xx/5xx split into ELB-generated versus target-generated, so a gateway fault is
   distinguishable from an upstream one.
@@ -484,8 +483,7 @@ gateway end-to-end latency p95 (ALB target response time, target 30 s), error
 rate split by class (target under 1%), model latency p95 (Bedrock invocation
 latency, target 15 s), the output:input token ratio, and the gate fail-closed
 rate per team (target 0%). Each target is drawn as a horizontal annotation whose
-value comes from one `locals` block, and attainment over the viewed range is
-shown as a single value where CloudWatch can express it. **The targets are
+value comes from one `locals` block. **The targets are
 illustrative for a demo workload, and the two latency targets are provisional** —
 placeholders to be replaced by a measured baseline from the live run, not
 negotiated SLOs. The token ratio is shown deliberately **without** a target,

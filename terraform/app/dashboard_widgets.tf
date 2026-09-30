@@ -26,7 +26,7 @@ locals {
       width  = 24
       height = 1
       properties = {
-        markdown = "## Platform health — both Fargate services, the load balancer, the Service Connect gate hop, and both DynamoDB tables. Model-call indicators are platform-wide (shared master key, no per-agent identity); governance is per team below."
+        markdown = "## Platform health"
       }
     },
     # ECS CPU/Memory for gate and LiteLLM. These always have data once a task
@@ -38,7 +38,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ECS CPU % (avg) — gate vs LiteLLM"
+        title  = "CPU % (gate, LiteLLM)"
         region = local._r
         view   = "timeSeries"
         stat   = "Average"
@@ -55,7 +55,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ECS Memory % (avg) — gate vs LiteLLM"
+        title  = "Memory % (gate, LiteLLM)"
         region = local._r
         view   = "timeSeries"
         stat   = "Average"
@@ -74,7 +74,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ECS running tasks — gate vs LiteLLM"
+        title  = "Running tasks"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -94,7 +94,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ALB healthy hosts — LiteLLM target group"
+        title  = "Healthy LiteLLM targets"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -135,7 +135,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "Service Connect gate hop — requests & p95 response time"
+        title  = "Gate hop: requests, p95 (ms)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -151,7 +151,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "Service Connect gate hop — response codes (2xx/4xx/5xx)"
+        title  = "Gate hop: response codes"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -164,40 +164,20 @@ locals {
         ]
       }
     },
-    # DynamoDB, both tables. SuccessfulRequestLatency and SystemErrors are
-    # published only on (TableName, Operation) -- never TableName alone -- so each
-    # names the operations the store issues (iam.tf least-privilege). SystemErrors
-    # and ThrottledRequests may never fire, so FILLed.
+    # DynamoDB, both tables. SystemErrors is published only on
+    # (TableName, Operation) -- never TableName alone -- so it names an operation
+    # the store issues (iam.tf least-privilege). SystemErrors and
+    # ThrottledRequests may never fire, so FILLed. (A latency widget was dropped
+    # at the owner's request: it added noise, not a decision.)
     # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/metrics-dimensions.html
     {
       type   = "metric"
       x      = 0
       y      = 13
-      width  = 12
+      width  = 24
       height = 6
       properties = {
-        title  = "DynamoDB SuccessfulRequestLatency p95 (ms) — approvals & audit, by operation"
-        region = local._r
-        view   = "timeSeries"
-        stat   = "p95"
-        metrics = concat(
-          [for op in local.ddb_approvals_ops :
-            ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", local.approvals_table, "Operation", op, { label = "approvals ${op}" }]
-          ],
-          [for op in local.ddb_audit_ops :
-            ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", local.audit_table, "Operation", op, { label = "audit ${op}" }]
-          ],
-        )
-      }
-    },
-    {
-      type   = "metric"
-      x      = 12
-      y      = 13
-      width  = 12
-      height = 6
-      properties = {
-        title  = "DynamoDB throttles & system errors — both tables (0 when healthy)"
+        title  = "DynamoDB throttles and errors"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -230,7 +210,7 @@ locals {
       width  = 24
       height = 1
       properties = {
-        markdown = "## Gateway traffic — the public ALB in front of LiteLLM. 4xx/5xx are split ELB-generated vs target-generated so a gateway fault is distinguishable from an upstream one."
+        markdown = "## Gateway traffic"
       }
     },
     {
@@ -240,7 +220,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ALB request count"
+        title  = "Requests"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -256,7 +236,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ALB target response time — p50 / p95 (s)"
+        title  = "Response time p50, p95 (s)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -272,7 +252,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "ALB 4xx/5xx — ELB-generated vs target-generated (0 when healthy)"
+        title  = "4xx/5xx: ALB vs LiteLLM"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -304,7 +284,7 @@ locals {
       width  = 24
       height = 1
       properties = {
-        markdown = "## Model — Amazon Bedrock via the EU inference profile. Platform-wide, not per team: with a shared master key and no per-agent gateway keys, a model call carries no team identity (R60)."
+        markdown = "## Model, platform-wide"
       }
     },
     {
@@ -314,7 +294,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "Bedrock invocations & latency p95 (ms)"
+        title  = "Invocations, latency p95 (ms)"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -331,7 +311,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "Bedrock tokens — input, output, and output:input ratio"
+        title  = "Tokens, output:input ratio"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -352,7 +332,7 @@ locals {
       width  = 8
       height = 6
       properties = {
-        title  = "Bedrock errors — client / server / throttles (0 when healthy)"
+        title  = "Errors: client, server, throttle"
         region = local._r
         view   = "timeSeries"
         metrics = [
@@ -382,7 +362,7 @@ locals {
       width  = 24
       height = 1
       properties = {
-        markdown = "## Governance — per team, from the gate's decision log. Counts only; no prompt, response or tool-argument content (R33, R60). A quiet team shows a flat 0, not a blank."
+        markdown = "## Governance per team"
       }
     },
     # Decisions by classification, per team. Each visible series is a FILLed math
@@ -399,7 +379,7 @@ locals {
       width  = 12
       height = 6
       properties = {
-        title   = "Decisions by classification, per team"
+        title   = "By classification"
         region  = local._r
         view    = "timeSeries"
         stacked = true
@@ -421,7 +401,7 @@ locals {
       width  = 12
       height = 6
       properties = {
-        title   = "Decisions by outcome, per team (approve = parked)"
+        title   = "By outcome (approve = parked)"
         region  = local._r
         view    = "timeSeries"
         stacked = true
@@ -443,7 +423,7 @@ locals {
       width  = 12
       height = 6
       properties = {
-        title  = "Unknown-tool denials & parks, per team"
+        title  = "Unknown-tool denials, parks"
         region = local._r
         view   = "timeSeries"
         metrics = concat(
@@ -471,7 +451,7 @@ locals {
       width  = 12
       height = 6
       properties = {
-        title  = "Auth rejections (no team) & fail-closed by team + unattributed"
+        title  = "Auth rejections, fail-closed"
         region = local._r
         view   = "timeSeries"
         metrics = concat(
