@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -49,6 +50,41 @@ def db_path(tmp_path: Path) -> Path:
 @pytest.fixture(params=["sqlite", "dynamodb"])
 def store_backend(request: pytest.FixtureRequest) -> str:
     return request.param
+
+
+@pytest.fixture(autouse=True)
+def _moto_writes_are_atomic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give moto's fake the per-write atomicity real DynamoDB has.
+
+    DynamoDB evaluates a write's ConditionExpression and applies the write as one
+    atomic step. moto does not: its ``delete_item`` reads the item, evaluates the
+    condition, then deletes, with nothing held in between, so two threads can
+    both pass the condition and both "win". That made the concurrent one-shot
+    test flaky -- a fault in the fake, not in the store, and proven by widening
+    the gap inside moto, which turned one winner into six.
+
+    Serialising moto's write operations restores the property the store relies
+    on without weakening the test: a store that claimed a grant by reading and
+    then deleting unconditionally would still produce several winners, because
+    the lock covers each single call, not the gap between two of them. The lock
+    is re-entrant because a transaction applies its items through the same
+    backend methods.
+
+    Autouse, because several test modules build their own moto fixture and
+    every one of them needs the same property; patching the class is inert
+    for tests that never start moto.
+    """
+    from moto.dynamodb.models import DynamoDBBackend
+
+    lock = threading.RLock()
+    for name in ("put_item", "update_item", "delete_item", "transact_write_items"):
+        original = getattr(DynamoDBBackend, name)
+
+        def serialised(*args: Any, _original: Any = original, **kwargs: Any) -> Any:
+            with lock:
+                return _original(*args, **kwargs)
+
+        monkeypatch.setattr(DynamoDBBackend, name, serialised)
 
 
 @pytest.fixture
