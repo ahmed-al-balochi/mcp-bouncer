@@ -368,7 +368,30 @@ the call is released exactly once. A third identical run parks again. Approval i
 come only from `bouncer list` or the audit log — never from the model's text (see
 the limitations below).
 
-### 7. Tear down
+### 7. Watch it on the dashboard
+
+The app stack creates one CloudWatch dashboard covering platform health (both
+services, the load balancer, both tables), gateway traffic, model usage, and the
+gate's decisions per team, plus a row of service-level indicators against their
+targets. Open it — the name and a console URL are both derived from
+`terraform output`, so nothing here is specific to one account:
+
+```bash
+terraform output -raw dashboard_name
+terraform output -raw dashboard_url    # open this in a browser
+```
+
+After live traffic from both teams, every row shows data (metrics that never
+fire on a healthy stack are drawn as a flat 0, not a blank), the governance row
+separates the teams, and each SLI shows its target as a horizontal line. The SLI
+targets are **illustrative for a demo workload**, and the two latency targets are
+**provisional** until replaced by a measured baseline from the live run. Some
+indicators are deliberately absent (time to first token, fallback engagement,
+cache hit rate, cost in currency) and named as such on the dashboard, with the
+reason for each. Alarms are limited to the single fail-closed alarm on purpose;
+the dashboard observes, it does not page.
+
+### 8. Tear down
 
 ```bash
 cd terraform/app
@@ -435,6 +458,12 @@ the deployment shape. This README does not repeat it.
 - **Masking.** The gate blocks or parks; it does not redact tool results.
 - **Prompt-injection detection** in tool output fed back to a model.
 - A UI. The operator surface is a CLI.
+- **Alarms and paging on service levels.** The dashboard shows the SLIs against
+  their targets, but the only alarm is the fail-closed one; nothing pages on an
+  SLI breach.
+- **Per-team model-call indicators.** Model usage is platform-wide on the
+  dashboard, because without per-agent gateway keys a model call carries no team
+  identity. Tool-call governance is per team.
 
 ## Licence
 

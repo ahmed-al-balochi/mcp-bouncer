@@ -396,6 +396,121 @@ misbehaving turn cannot be reconstructed from the logs, and reproducing it means
 re-running the prompt. For a POC that keeps content out of a log group entirely,
 that is the accepted trade.
 
+## Observability
+
+**One dashboard, built only from what the stack already emits.** The `app/`
+stack defines a single CloudWatch dashboard (`terraform/app/dashboard.tf`) whose
+name comes from the project name and whose body is `jsonencode`d from Terraform
+references — every service name, table name, ARN suffix, dimension value and the
+region is a reference, never a literal, so nothing account-specific is committed.
+It has four observation rows and an SLI row:
+
+- **Platform health.** Both Fargate services (CPU, memory, running task count),
+  the ALB healthy-host count for the LiteLLM target group (the gate has none —
+  it is internal-only), the Service Connect gate hop (requests, p95 response
+  time, 2xx/4xx/5xx), and both DynamoDB tables. DynamoDB latency and system
+  errors are published only on the `(TableName, Operation)` dimension pair, never
+  on `TableName` alone, so those widgets name the operations the store actually
+  issues (`GetItem`/`PutItem`/`Query`/`DeleteItem`), per the DynamoDB metrics
+  documentation.
+- **Gateway traffic.** ALB request count, target response time p50/p95, and the
+  4xx/5xx split into ELB-generated versus target-generated, so a gateway fault is
+  distinguishable from an upstream one.
+- **Model.** Bedrock invocations, invocation latency p95, input/output token
+  counts and the output:input ratio, and errors split client/server/throttle.
+  The `ModelId` dimension value is the inference profile id (the `eu.` profile),
+  taken from the Terraform variable.
+- **Governance, per team.** Decisions by classification and by outcome, unknown
+  tool denials, parks (a `decision=approve` outcome), auth rejections, and the
+  fail-closed count — all per team, from metric filters on the gate's JSON
+  decision log.
+
+**Where each number comes from.** The AWS-namespace rows read the metrics ECS,
+the ALB, DynamoDB and Bedrock publish automatically. The Service Connect gate hop
+reads the two dimension families ECS actually publishes: the inbound
+`RequestCount` on `(DiscoveryName, ServiceName, ClusterName)` (the gate is the
+server), and the target-attributed series (`HTTPCode_Target_*`,
+`TargetResponseTime`) on `TargetDiscoveryName` alone — the target metrics are
+attributed to the *calling* service, and the caller here is a client-only Service
+Connect config, so the single-dimension set aggregates the hop across callers
+without depending on a client `ServiceName` CloudWatch may not stamp. The
+governance row is backed
+by new CloudWatch Logs metric filters over the gate's structured log
+(`aws_cloudwatch_log_group.task`): they key on `$.event` exactly as the existing
+fail-closed filter does, count `decision`/`fail_closed`/`auth_rejected` lines,
+and carry **only `team`** as a dimension. `caller`, `tool` and `args_hash` are
+never dimensions — they are unbounded and would both explode custom-metric
+cardinality and surface identity or argument detail the dashboard must not show.
+`team` is bounded by `policy.yaml` (every caller's team is validated at boot), so
+its cardinality is the number of teams. No widget — metric or the few text
+panels — carries prompt, response or tool-argument content; the governance
+metrics are counts over bounded enum fields, so there is no content path to leak.
+
+**Why model SLIs are platform-wide.** Model-call indicators cannot be attributed
+to a team: with a shared master key and no per-agent gateway keys, a model call
+carries no team identity (there is no per-agent database to bind it to), so
+Bedrock usage is measured platform-wide. Tool-call governance *is* per team,
+because each tool call carries the caller's forwarded gate token and the gate
+resolves the team from it. The dashboard states this in a visible text panel so a
+viewer is not left to infer it.
+
+**"No data" versus zero.** CloudWatch only creates a metric once it has been
+emitted, so a widget on a metric that never fires in a healthy stack — a 5xx
+count, a Bedrock server error, a throttle, a team that sent no traffic yet — would
+read "no data" rather than 0, and a dashboard row that reads blank is
+indistinguishable from a broken one. Every such series is therefore drawn through
+metric math `FILL(m, 0)`, so a healthy stack shows a flat zero line and every row
+shows data. A wrinkle forced this shape: a metric filter that assigns dimensions
+**cannot** also declare a filter default value, so the per-team governance metrics
+cannot fall back to 0 at the filter; `FILL` in the widget is the only way to make
+a quiet team read 0. The one exception is the total, undimensioned `FailClosed`
+filter, which keeps its filter `default_value = 0` — and that filter and its alarm
+are left exactly as they were.
+
+**The fail-closed line now carries `team`.** `log_fail_closed` gained a `team`
+field so the fail-closed rate can be read per team. It is `null` when identity
+failed before the caller was known — an honestly unattributed block, never
+guessed. A CloudWatch metric-filter dimension is published only when the field is
+present in the log line, so a null-team fail-closed is not counted by the
+per-team `FailClosedByTeam` metric. That would silently drop it, so the dashboard
+also reads the existing undimensioned `FailClosed` total and computes
+`unattributed = total − Σ(per-team)` via metric math, floored at zero, and labels
+it "unattributed" — so a block that could not be attributed is still visible
+rather than lost.
+
+**Service levels are shown against illustrative targets.** The SLI row shows
+gateway availability (`1 − (target 5xx + ELB 5xx) / requests`, target 99.5%),
+gateway end-to-end latency p95 (ALB target response time, target 30 s), error
+rate split by class (target under 1%), model latency p95 (Bedrock invocation
+latency, target 15 s), the output:input token ratio, and the gate fail-closed
+rate per team (target 0%). Each target is drawn as a horizontal annotation whose
+value comes from one `locals` block, and attainment over the viewed range is
+shown as a single value where CloudWatch can express it. **The targets are
+illustrative for a demo workload, and the two latency targets are provisional** —
+placeholders to be replaced by a measured baseline from the live run, not
+negotiated SLOs. The token ratio is shown deliberately **without** a target,
+labelled that a normal band needs history this demo does not have.
+
+The availability and error-rate SLIs divide by the load balancer's total request
+count, while target 5xx is counted on the gateway's target group alone. The total
+also includes requests the load balancer answers itself (the HTTP-to-HTTPS
+redirect and the 404 for any other host), which can never produce a target 5xx,
+so both SLIs lean slightly optimistic. With one target group the effect is
+small, but it always errs towards looking healthier.
+
+**What is deliberately absent from the dashboard, and why.** Four indicators are
+named as absent rather than approximated: time to first token (the gateway calls
+Bedrock non-streaming, so `TimeToFirstToken` has never been emitted), fallback
+engagement (one model, no fallback), cache hit rate (no prompt caching), and cost
+in currency (pricing would have to be hardcoded, which would silently go stale in
+the no-internet VPC — token counts are shown instead, from which cost can be
+derived out of band).
+
+**Alarms are deliberately limited to the fail-closed one.** These widgets are for
+observation, not paging; per REQUIREMENTS §8, alarms and paging on service levels
+are out of scope, and the single alarm remains the fail-closed signal that a task
+booted and then lost its store while the shallow health check still passes.
+
 ## Deployment
 
 **Two Terraform stacks, and bootstrap is never destroyed.** `bootstrap/` holds
@@ -530,6 +645,16 @@ would change first if this had to become real are specific.
 - **Re-keyed DynamoDB partitions** (time-bucketed) for the pending, dedup, and
   audit access patterns, before write throughput hits the constant-partition
   ceiling.
+- **A measured baseline behind the two provisional latency targets.** The
+  dashboard's gateway and model latency SLIs ship with provisional targets
+  (30 s and 15 s); replacing them with a target derived from the live run is the
+  first thing to firm up once real traffic exists. The other targets are
+  illustrative for a demo workload and would likewise be renegotiated for a real
+  one.
+- **Alarms and paging on service levels.** The dashboard observes; it does not
+  page. The only alarm is the fail-closed one. Real operation would add SLI
+  alarms with burn-rate windows once the targets above are measured rather than
+  provisional.
 - Not built at all, and not planned: result masking or redaction, prompt-injection
   detection in tool output, a UI beyond the CLI, multi-region / autoscaling /
   disaster recovery, Redis, external model providers, and trace storage such as a

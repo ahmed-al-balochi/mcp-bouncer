@@ -239,11 +239,16 @@ def log_upstream_ready(*, duration_ms: int, tool_count: int) -> None:
     _emit(logging.INFO, "upstream_ready", duration_ms=duration_ms, tool_count=tool_count)
 
 
-def log_fail_closed(*, caller: str, tool: str) -> None:
+def log_fail_closed(*, caller: str, team: str | None, tool: str) -> None:
     """Record a fail-closed block: an internal error denied a call (R13).
 
     No exception object and no arguments -- only that the gate denied a call for
     `caller` on `tool` because its own checks could not complete.
+
+    `team` is carried so the fail-closed rate can be read per team (R59), with
+    the same field name as the decision line so both can be grouped together. It
+    is None when the failure happened before the caller could be identified:
+    such a block is honestly unattributed, never guessed.
 
     That is deliberately a thin signal, and the trade is explicit: the middleware
     does NOT log the exception, because an exception raised anywhere below it may
@@ -253,4 +258,4 @@ def log_fail_closed(*, caller: str, tool: str) -> None:
     stack trace. For a component whose job is to deny, losing a trace is the
     cheaper failure than leaking an argument into a log stream.
     """
-    _emit(logging.ERROR, "fail_closed", caller=caller, tool=tool)
+    _emit(logging.ERROR, "fail_closed", caller=caller, team=team, tool=tool)

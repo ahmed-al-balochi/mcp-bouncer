@@ -78,7 +78,7 @@ class GateMiddleware(Middleware):
         except Exception:
             tool = _peek_tool(context)
             self._audit_best_effort(tool, caller=UNREADABLE)
-            observability.log_fail_closed(caller=UNREADABLE, tool=tool)
+            observability.log_fail_closed(caller=UNREADABLE, team=None, tool=tool)
             return _error(_FAIL_CLOSED)
 
         try:
@@ -86,7 +86,7 @@ class GateMiddleware(Middleware):
         except Exception:
             self._audit_best_effort(_peek_tool(context), caller=identity.caller)
             observability.log_fail_closed(
-                caller=identity.caller, tool=_peek_tool(context)
+                caller=identity.caller, team=identity.team, tool=_peek_tool(context)
             )
             return _error(_FAIL_CLOSED)
 

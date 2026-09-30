@@ -249,3 +249,79 @@ def test_a_logging_failure_does_not_change_an_allowed_calls_outcome(
 
     parked = _call(gate, "wiki.delete_page", {"title": "home"})
     assert parked.is_error is True, "a logging failure turned a blocked call into a pass"
+
+
+# --- fail-closed lines are attributable to a team (R59) -------------------
+
+
+def _fail_closed_lines(buffer: io.StringIO) -> list[dict[str, Any]]:
+    return [entry for entry in _lines(buffer) if entry.get("event") == "fail_closed"]
+
+
+def test_a_fail_closed_block_names_the_callers_team(
+    captured_logs: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_path: Path,
+    db_path: Path,
+):
+    """The per-team fail-closed rate (R59) groups these lines by `team`.
+
+    The failure is injected AFTER the caller is identified, so the team is known
+    and must be on the line. A fail-closed block writes no decision line, which
+    is why the rate's denominator has to count both events.
+    """
+    from gate import policy
+
+    def explode(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("classifier is broken")
+
+    monkeypatch.setattr(policy, "classify", explode)
+    gate = build_gate(
+        build_server(),
+        policy_path=policy_path,
+        db_path=db_path,
+        default_caller="agent-1",
+        team="CustomerChat",
+    )
+
+    result = _call(gate, "wiki.read_page", {"title": SENTINEL_ARG})
+    assert result.is_error is True
+
+    lines = _fail_closed_lines(captured_logs)
+    assert len(lines) == 1
+    assert lines[0]["team"] == "CustomerChat"
+    assert lines[0]["caller"] == "agent-1"
+    assert lines[0]["tool"] == "wiki.read_page"
+    assert SENTINEL_ARG not in captured_logs.getvalue()
+    assert not [e for e in _lines(captured_logs) if e.get("event") == "decision"]
+
+
+def test_a_fail_closed_block_before_identification_is_unattributed(
+    captured_logs: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    policy_path: Path,
+    db_path: Path,
+):
+    """If identity itself fails, there is no team to name, and none is guessed:
+    the field is present and null, so the block counts as unattributed."""
+    from gate.middleware import GateMiddleware
+
+    def explode(_self: Any) -> Any:
+        raise RuntimeError("identity source is broken")
+
+    monkeypatch.setattr(GateMiddleware, "_resolve_identity", explode)
+    gate = build_gate(
+        build_server(),
+        policy_path=policy_path,
+        db_path=db_path,
+        default_caller="agent-1",
+        team="CustomerChat",
+    )
+
+    result = _call(gate, "wiki.read_page", {"title": "home"})
+    assert result.is_error is True
+
+    lines = _fail_closed_lines(captured_logs)
+    assert len(lines) == 1
+    assert "team" in lines[0]
+    assert lines[0]["team"] is None

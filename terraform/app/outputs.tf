@@ -101,3 +101,17 @@ output "cluster_name" {
   description = "ECS cluster name, for `aws ecs` debugging."
   value       = aws_ecs_cluster.this.name
 }
+
+output "dashboard_name" {
+  description = "Name of the CloudWatch dashboard (R58). The README derives it from this output rather than pasting a value."
+  value       = aws_cloudwatch_dashboard.this.dashboard_name
+}
+
+output "dashboard_url" {
+  description = <<-EOT
+    Console URL for the CloudWatch dashboard, built from references (the region
+    data source and the dashboard name) so no region or account literal is
+    pasted (R2, R3, R39). Open it after `terraform apply`.
+  EOT
+  value       = "https://${data.aws_region.current.region}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.region}#dashboards:name=${aws_cloudwatch_dashboard.this.dashboard_name}"
+}

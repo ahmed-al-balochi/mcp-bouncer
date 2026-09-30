@@ -154,6 +154,27 @@ None may regress.
 - **R57** The gateway, like the gate, has no internet path. It works entirely
   through VPC endpoints.
 
+### 4.6 Dashboard and service levels
+
+- **R58** One CloudWatch dashboard, part of the `app/` stack, shows platform
+  health (both services, the load balancer, both tables), gateway traffic,
+  model usage, and the gate's decisions per team. It is built only from
+  metrics and logs the stack already emits. Every resource it names comes from
+  a Terraform reference, never a literal (R39).
+- **R59** Service level indicators are shown against stated targets:
+  gateway availability, gateway end-to-end latency (p95), error rate split by
+  class, model latency (p95), output-to-input token ratio, and the gate's
+  fail-closed rate per team. Targets are illustrative for a demo workload and
+  documented as such.
+- **R60** Model-call indicators are platform-wide, because without per-agent
+  gateway keys a model call carries no team identity. Tool-call indicators are
+  per team, from the gate's decision log. No widget carries prompt, response or
+  tool-argument content (R33, R56).
+- **R61** Indicators the deployment cannot measure honestly are listed as
+  absent, not approximated: time to first token (no streaming), fallback
+  engagement (one model), cache hit rate (no prompt caching), and cost in
+  currency.
+
 ## 5. Infrastructure requirements
 
 - **R34** Terraform, split into two stacks:
@@ -249,6 +270,8 @@ Stated plainly in the README rather than left to be discovered:
 - Per-agent gateway keys, model allowlists and budgets (they need a database).
 - Trace storage such as Langfuse; Redis; external model providers; data
   classes.
+- Alarms and paging on service levels. The only alarm is the fail-closed one.
+- Per-team model-call indicators (they need per-agent gateway keys).
 
 ## 9. Acceptance criteria
 
@@ -285,3 +308,6 @@ Verifiable, in order:
   shown live).
 - **A15** The gate does not answer from the internet, only from the gateway.
 - **A16** An agent without a gate token cannot run any tool.
+- **A17** After live traffic through the gateway from both teams, every
+  dashboard row shows data, the governance row separates the two teams, and
+  every SLI widget shows its target.
