@@ -56,6 +56,9 @@ basic pieces a team would put in front of agents:
 It is a proof of concept on Fargate, not a product: one task per service, one
 region, and the limits listed under [Known limitations](#known-limitations).
 
+Using a coding agent to run or deploy it? Point it at [`AGENTS.md`](AGENTS.md),
+the house rules: where it must stop for you, and what it must never do.
+
 ## Why classification follows reversibility
 
 The class boundary is not "does this change something" but **"can this be
