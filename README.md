@@ -254,6 +254,11 @@ DNS records to. All values that describe *your* account live in a gitignored
 `terraform.tfvars`; copy the committed `terraform.tfvars.example` in each stack
 and fill in your own.
 
+Use a read-only role for everything that only reads (`terraform plan`, checking
+resources, reading logs), and admin credentials only for the applies. This
+matters more if an agent is doing the work: it cannot write with credentials
+that do not allow it.
+
 ### 1. Bootstrap (applied once, never destroyed)
 
 The bootstrap stack creates the DNS zone, the TLS certificate, and the two ECR

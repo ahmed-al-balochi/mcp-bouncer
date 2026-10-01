@@ -52,6 +52,10 @@ shows it: a model with no tools can print a convincing fake one.
 
 ## Rules
 
+- Use read-only credentials for anything that only reads: tests against AWS,
+  `terraform plan`, describing resources, reading logs and metrics. Ask the
+  human for a read-only role or profile. Admin credentials can write no matter
+  what you intend, so switch to them only for a step the human has approved.
 - Never commit `terraform.tfvars`, tokens, the gateway key, account ids, your
   domain or IP addresses. They belong in the gitignored `terraform.tfvars`.
 - Get secrets only through `terraform output -raw tokens_get_command` and
