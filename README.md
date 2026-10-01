@@ -50,8 +50,7 @@ basic pieces a team would put in front of agents:
 ![The platform dashboard in CloudWatch](docs/images/dashboard.png)
 
 It is a proof of concept on Fargate, not a product: one task per service, one
-region, and the limits listed under [Known limitations](#known-limitations) and
-[Not built, on purpose](#not-built-on-purpose).
+region, and the limits listed under [Known limitations](#known-limitations).
 
 ## Why classification follows reversibility
 
@@ -437,9 +436,8 @@ bootstrap stack is left in place on purpose, so the delegation and images surviv
 
 ## Known limitations
 
-Stated plainly rather than left to be discovered (`DESIGN.md` covers the
-reasoning; the "Not built, on purpose" section below lists the full out-of-scope
-set):
+Stated plainly rather than left to be discovered. `DESIGN.md` covers the
+reasoning.
 
 - **Approver authorisation is not built.** Anyone who can reach the store can
   approve a parked call.
@@ -478,34 +476,18 @@ set):
   attacker-drivable auth-rejection log volume** (a fixed-reason line per refused
   call, leaking no token, bounded by the security group). Both are named in
   `DESIGN.md`; neither is fixed for the POC.
-- No result masking, no prompt-injection detection, no UI beyond the CLI, and no
-  multi-region, autoscaling, or disaster recovery.
+- **The dashboard observes; it does not page.** The only alarm is the
+  fail-closed one. Model usage is shown platform-wide, because without
+  per-agent gateway keys a model call carries no team. Tool calls are per team.
+- No result masking, no prompt-injection detection, no UI beyond the CLI, no
+  tracing backend or external model providers, and no multi-region, autoscaling,
+  or disaster recovery.
 
 ## Design
 
 See `DESIGN.md` for the reasoning behind classification-by-reversibility, the
 identity-by-transport decision, the storage port, the three EU-only layers, and
 the deployment shape. This README does not repeat it.
-
-## Not built, on purpose
-
-- **Approver authorisation.** Anyone who can reach the store can approve.
-- **Masking.** The gate blocks or parks; it does not redact tool results.
-- **Prompt-injection detection** in tool output fed back to a model.
-- A UI. The operator surface is a CLI.
-- **Alarms and paging on service levels.** The dashboard shows the SLIs against
-  their targets, but the only alarm is the fail-closed one; nothing pages on an
-  SLI breach.
-- **Per-team model-call indicators.** Model usage is platform-wide on the
-  dashboard, because without per-agent gateway keys a model call carries no team
-  identity. Tool-call governance is per team.
-- **Per-agent gateway keys, model allowlists, and budgets.** All three need a
-  database behind the gateway, which the lean design left out.
-- **Multi-region, autoscaling, and disaster recovery.** The deployment is a
-  single-region proof of concept.
-- **Trace storage and external model providers.** No tracing backend, no Redis,
-  no external model providers, and no data classes; the no-egress design would
-  forbid the egress most of these need anyway.
 
 ## Licence
 

@@ -504,7 +504,7 @@ the no-internet VPC: token counts are shown instead, from which cost can be
 derived out of band).
 
 **Alarms are deliberately limited to the fail-closed one.** These widgets are for
-observation, not paging; as the README's "Not built, on purpose" section records,
+observation, not paging; as the README's "Known limitations" section records,
 alarms and paging on service levels are out of scope, and the single alarm
 remains the fail-closed signal that a task booted and then lost its store while
 the shallow health check still passes.
@@ -625,9 +625,8 @@ simply do not match a CloudWatch metric filter.
 
 ## Absences
 
-The out-of-scope list, recorded in full in the README's "Not built, on purpose"
-section, is deliberate, and the items that would change first if this had to
-become real are specific.
+The limits listed in the README's "Known limitations" section are deliberate,
+and the items that would change first if this had to become real are specific.
 
 - **Approver authorisation.** Anyone who can reach the DynamoDB table can approve
   a parked call; the store does not record or check who approved. This is the
