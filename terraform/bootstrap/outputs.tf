@@ -28,7 +28,7 @@ output "ecr_repository_name" {
 }
 
 output "ecr_litellm_repository_url" {
-  description = "Push the thin LiteLLM gateway image here (G1, D6.10)."
+  description = "Push the thin LiteLLM gateway image here."
   value       = aws_ecr_repository.litellm.repository_url
 }
 

@@ -1,20 +1,7 @@
 """Offline tests for the real-LLM demo agent (demo/llm_agent.py).
 
-The agent's whole job is to put the right bytes on the wire: the OpenAI
-chat-completions request the LiteLLM gateway expects, with the bouncer MCP tool
-block unchanged and the agent's gate token forwarded, and to keep secrets out of
-every output. None of that needs a real gateway to verify -- it needs to observe
-what the SDK actually sends.
-
-So these tests stand up a fake OpenAI-compatible server on 127.0.0.1 with the
-standard library's `http.server` in a thread (no new test dependency, R44) and
-point the *real* openai SDK at it via `base_url`. Every assertion is on what the
-SDK sent or how the agent behaved -- never on a mock of the SDK -- so the tests
-prove the SDK's real pass-through behaviour, which is the part that is otherwise
-UNVERIFIED until the live G3 run.
-
-Fully offline: the server binds loopback, nothing leaves the host, and the
-agent's config comes from an explicit env dict, never the ambient environment.
+They point the real openai SDK at a stdlib fake server on loopback and assert on
+what the SDK actually sent, proving its real pass-through behaviour. Fully offline.
 """
 
 from __future__ import annotations
@@ -37,8 +24,7 @@ FAKE_TOKEN = "gate-token-DO-NOT-LEAK-xyz789"
 class _Recorder:
     """Shared state between the test and the fake server thread.
 
-    Records every request the server saw and holds the scripted response(s). A
-    plain object guarded by the server's single-request-at-a-time handling; the
+    Records every request the server saw and holds the scripted response(s). The
     tests read it only after the client call returns.
     """
 
@@ -49,11 +35,9 @@ class _Recorder:
         self.body: dict[str, Any] = _completion("done")
         # For the redaction test: an error body that echoes the secrets back.
         self.error_body: dict[str, Any] = {"error": {"message": "boom"}}
-        # Preflight (GET /mcp-rest/tools/list) scripting. By default the gateway
-        # reports one bouncer tool, so the preflight is satisfied and completion
-        # proceeds -- this keeps the pre-existing completion tests passing (D6.22).
-        # A test sets preflight_status to a 4xx/5xx to exercise the error paths,
-        # or preflight_tools to [] to exercise the zero-tools refusal.
+        # Preflight (GET /mcp-rest/tools/list) scripting. By default one bouncer
+        # tool is reported, so the preflight passes and completion proceeds. A
+        # test sets preflight_status to a 4xx/5xx or preflight_tools to [].
         self.preflight_status: int = 200
         self.preflight_tools: list[dict[str, Any]] = [
             {"name": "wiki.read_page", "mcp_info": {"server_name": "bouncer"}}
@@ -85,8 +69,7 @@ def _make_handler(recorder: _Recorder):
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             # The only GET the agent makes is the preflight to
-            # /mcp-rest/tools/list (D6.22). Record it (path + headers) so tests
-            # can assert the credentials it carried, then answer per the recorder.
+            # /mcp-rest/tools/list. Record it, then answer per the recorder.
             recorder.requests.append(
                 {
                     "method": "GET",
@@ -147,8 +130,8 @@ def _make_handler(recorder: _Recorder):
 def server() -> Iterator[tuple[str, _Recorder]]:
     """Run the fake OpenAI server on a free loopback port; yield its base URL.
 
-    The base URL ends in /v1, matching what terraform's gateway_openai_base_url
-    emits and what the agent expects, so the SDK POSTs to /v1/chat/completions.
+    The base URL ends in /v1, matching gateway_openai_base_url, so the SDK POSTs
+    to /v1/chat/completions.
     """
     recorder = _Recorder()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(recorder))
@@ -177,7 +160,7 @@ def _posts(recorder: _Recorder) -> list[dict[str, Any]]:
     """The completion requests (POST /v1/chat/completions) the server recorded.
 
     Filtering by method keeps the completion assertions independent of the
-    preflight GET, which now precedes every completion by default (D6.22).
+    preflight GET that now precedes every completion by default.
     """
     return [r for r in recorder.requests if r["method"] == "POST"]
 
@@ -191,7 +174,7 @@ def _gets(recorder: _Recorder) -> list[dict[str, Any]]:
 
 
 def test_request_shape_on_the_wire(server, capsys):
-    """The SDK POSTs the exact request the gateway expects (D6.17 shape)."""
+    """The SDK POSTs the exact request the gateway expects."""
     url, recorder = server
     config = llm_agent.load_config(_env(url), require_gate_token=True)
 
@@ -200,7 +183,7 @@ def test_request_shape_on_the_wire(server, capsys):
     )
     assert rc == 0
 
-    # Exactly one completion request (the preflight GET precedes it; asserted in
+    # Exactly one completion request (the preflight GET precedes it, asserted in
     # its own test). Filter by method so this stays about the completion shape.
     posts = _posts(recorder)
     assert len(posts) == 1
@@ -219,8 +202,8 @@ def test_request_shape_on_the_wire(server, capsys):
         {"role": "user", "content": "Read the home page."},
     ]
 
-    # The MCP tool block survives the SDK unchanged -- this is the pass-through
-    # of a LiteLLM extension the SDK does not type, proven on the real wire.
+    # The MCP tool block survives the SDK unchanged: the pass-through of a LiteLLM
+    # extension the SDK does not type, proven on the real wire.
     assert body["tools"] == [
         {
             "type": "mcp",
@@ -231,7 +214,7 @@ def test_request_shape_on_the_wire(server, capsys):
         }
     ]
 
-    # No temperature: Sonnet 5 rejects it (D6.5); the agent must not send one.
+    # No temperature: Sonnet 5 rejects it, so the agent must not send one.
     assert "temperature" not in body
 
     # The model's answer reached stdout.
@@ -239,7 +222,7 @@ def test_request_shape_on_the_wire(server, capsys):
 
 
 def test_model_flag_passes_through(server, capsys):
-    """--model reaches the request body verbatim (A14 demonstration lever)."""
+    """--model reaches the request body verbatim (a demonstration lever)."""
     url, recorder = server
     config = llm_agent.load_config(_env(url), require_gate_token=True)
     rc = llm_agent.run(
@@ -257,7 +240,7 @@ def test_model_flag_passes_through(server, capsys):
     [llm_agent.GATEWAY_URL_ENV, llm_agent.GATEWAY_KEY_ENV, llm_agent.TOKEN_ENV],
 )
 def test_missing_env_var_refuses_and_names_it(server, missing_var):
-    """Each missing variable -> ConfigError naming it, never printing a value."""
+    """Each missing variable raises ConfigError naming it, never printing a value."""
     url, _ = server
     env = _env(url)
     del env[missing_var]
@@ -285,11 +268,11 @@ def test_main_missing_var_exits_nonzero_without_value(server, monkeypatch, capsy
     assert FAKE_KEY not in captured.err
 
 
-# --- the gate token requirement and A16 ------------------------------------
+# --- the gate token requirement ------------------------------------
 
 
 def test_missing_gate_token_refuses_by_default(server):
-    """Gate token is required by default: its absence refuses to run (A16)."""
+    """Gate token is required by default: its absence refuses to run."""
     url, _ = server
     env = _env(url, token=None)
     with pytest.raises(llm_agent.ConfigError) as excinfo:
@@ -300,10 +283,8 @@ def test_missing_gate_token_refuses_by_default(server):
 
 def test_without_gate_token_sends_no_gate_header_anywhere(server, capsys):
     """--without-gate-token: NO preflight, and the request carries NO gate header.
-
-    Mirrors main()'s wiring: --without-gate-token skips the preflight (A16 expects
-    zero tools, so a preflight would correctly refuse and defeat the demo, D6.22)
-    and sends no gate-token header anywhere. Proves the A16 path stays intact.
+    Mirrors main()'s wiring: the flag skips the preflight (expecting zero tools)
+    and sends no gate-token header anywhere, so that path stays intact.
     """
     url, recorder = server
     # No token in env, and the flag lets config load anyway.
@@ -338,7 +319,7 @@ def test_without_gate_token_sends_no_gate_header_anywhere(server, capsys):
 
 
 def test_bad_request_unknown_model_is_a_clean_stderr_line(server, capsys):
-    """A 400 (e.g. 'Invalid model name') -> one clear stderr line, non-zero."""
+    """A 400 (e.g. 'Invalid model name') gives one clear stderr line, non-zero."""
     url, recorder = server
     recorder.status_sequence = [400]
     recorder.error_body = {"error": {"message": "Invalid model name: bogus"}}
@@ -355,7 +336,7 @@ def test_bad_request_unknown_model_is_a_clean_stderr_line(server, capsys):
 
 
 def test_401_message_and_secrets_never_leak_even_when_echoed(server, capsys):
-    """A 401 whose body echoes the key and token -> clear line, secrets redacted."""
+    """A 401 whose body echoes the key and token gives a clear line, secrets redacted."""
     url, recorder = server
     recorder.status_sequence = [401]
     # The server echoes both secrets back in its error body, as a hostile or
@@ -384,11 +365,10 @@ def test_401_message_and_secrets_never_leak_even_when_echoed(server, capsys):
 
 
 def test_max_retries_zero_means_exactly_one_request(server, capsys):
-    """A single 500 -> exactly ONE request received (no auto-retry). D6.17.
+    """A single 500 means exactly ONE request received, no auto-retry.
 
-    Mutation-sensitive by construction: if max_retries were left at the SDK
-    default of 2, the SDK would resend on the 5xx and the server would record
-    more than one request, failing this assertion.
+    If max_retries were left at the SDK default of 2, the SDK would resend on the
+    5xx and the server would record more than one request, failing this.
     """
     url, recorder = server
     recorder.status_sequence = [500]
@@ -402,20 +382,14 @@ def test_max_retries_zero_means_exactly_one_request(server, capsys):
     assert len(_posts(recorder)) == 1
 
 
-# --- the preflight (D6.22) -------------------------------------------------
+# --- the preflight ---------------------------------------------------------
 
 
 def test_preflight_carries_master_key_and_gate_token(server, capsys):
     """The preflight GET sends the gateway key as bearer AND the gate-token header.
 
-    This is the property that makes the preflight test the SAME credential the
-    tool call uses (D6.22): the LiteLLM master key as the request Authorization
-    bearer (the REST route's user_api_key_auth), and the gate token in the
-    x-mcp-bouncer-authorization header the REST handler parses off request.headers.
-
-    Not vacuous: if the preflight omitted either header, the corresponding
-    assertion below would fail. Verified by temporarily dropping each header from
-    preflight_tool_names -> this test failed on that header.
+    This makes the preflight test the same credentials the tool call uses. Not
+    vacuous: dropping either header fails the matching assertion below.
     """
     url, recorder = server
     config = llm_agent.load_config(_env(url), require_gate_token=True)
@@ -429,9 +403,9 @@ def test_preflight_carries_master_key_and_gate_token(server, capsys):
     assert len(gets) == 1
     pf = gets[0]
 
-    # Exact path and query the LiteLLM REST route expects (rest_endpoints.py:858).
+    # Exact path and query the LiteLLM REST route expects.
     assert pf["path"] == "/mcp-rest/tools/list?mcp_server_name=bouncer"
-    # Master key as the request bearer (the route's Depends(user_api_key_auth)).
+    # Master key as the request bearer (the route's auth dependency).
     assert pf["headers"]["authorization"] == f"Bearer {FAKE_KEY}"
     # Gate token in the per-server MCP auth header (parsed off request.headers).
     assert pf["headers"][llm_agent.GATE_TOKEN_HEADER] == f"Bearer {FAKE_TOKEN}"
@@ -441,14 +415,10 @@ def test_preflight_carries_master_key_and_gate_token(server, capsys):
 
 
 def test_preflight_zero_tools_refuses_before_any_completion(server, capsys):
-    """Zero bouncer tools -> exit non-zero, NO completion request at all (D6.22).
+    """Zero bouncer tools means exit non-zero and NO completion request at all.
 
-    The core D6.21 fix: the model is never asked when it would have no tools.
-
-    Not vacuous: the assertion that _posts(recorder) is empty fails if the agent
-    fell through to the model; the rc==1 assertion fails if it did not refuse.
-    Verified by temporarily making preflight_or_raise return on empty -> this
-    test failed (a completion POST appeared and rc was 0).
+    The core fix: the model is never asked when it would have no tools. Not
+    vacuous: empty _posts fails on fall-through, rc==1 fails if it did not refuse.
     """
     url, recorder = server
     recorder.preflight_tools = []  # gateway reports no bouncer tools
@@ -475,11 +445,10 @@ def test_preflight_zero_tools_refuses_before_any_completion(server, capsys):
 
 
 def test_preflight_401_refuses_with_distinct_message(server, capsys):
-    """A preflight 401 -> non-zero, a credential-rejection message, no completion.
+    """A preflight 401 gives non-zero, a credential-rejection message, no completion.
 
-    Not vacuous: rc==1 fails if the agent proceeded; the 'credential' wording and
-    the empty _posts assertion fail if the wrong branch ran or the model was
-    asked. Verified by pointing preflight_status at 200 -> this test failed.
+    Not vacuous: rc==1 fails if the agent proceeded, and the 'credential' wording
+    and empty _posts assertion fail if the wrong branch ran or the model was asked.
     """
     url, recorder = server
     recorder.preflight_status = 401
@@ -496,10 +465,9 @@ def test_preflight_401_refuses_with_distinct_message(server, capsys):
     assert "credential" in captured.err.lower()
     # Distinct from the 404 message: it must NOT talk about a version skew.
     assert "version skew" not in captured.err.lower()
-    # It must name BOTH candidate credentials, not just the gateway key: measured
-    # live, a gate token the gate rejects surfaces as 401 on this route, so a
-    # message blaming only the gateway key would misdirect the rotation case
-    # (D6.23). The two are indistinguishable from here.
+    # It must name BOTH candidate credentials, not just the gateway key: a gate
+    # token the gate rejects surfaces as 401 here too, so blaming only the gateway
+    # key would misdirect the rotation case. The two are indistinguishable here.
     assert "gate token" in captured.err.lower()
     assert "gateway key" in captured.err.lower()
     assert FAKE_KEY not in captured.err
@@ -508,14 +476,10 @@ def test_preflight_401_refuses_with_distinct_message(server, capsys):
 
 
 def test_preflight_404_says_route_may_be_absent(server, capsys):
-    """A preflight 404 -> non-zero, a version-skew message, no completion (D6.22).
+    """A preflight 404 gives non-zero, a version-skew message, no completion.
 
-    A 404 specifically should say the gateway may not expose this experimental
-    route (a plausible upstream change), distinct from the 401 message.
-
-    Not vacuous: the 'version skew' wording fails if the 404 branch did not run;
-    the empty _posts assertion fails if the model was asked. Verified by pointing
-    preflight_status at 200 -> this test failed.
+    A 404 should say the gateway may not expose this experimental route, distinct
+    from the 401 message, and the empty _posts assertion proves the model is spared.
     """
     url, recorder = server
     recorder.preflight_status = 404
@@ -534,18 +498,10 @@ def test_preflight_404_says_route_may_be_absent(server, capsys):
 
 
 def test_preflight_connection_error_refuses(capsys):
-    """A preflight that cannot connect -> non-zero, connection-specific message.
+    """A preflight that cannot connect gives non-zero and a connection message.
 
-    Points the agent at a closed port (nothing listening) so the httpx2 GET
-    raises a ConnectError, which preflight_tool_names must turn into a
-    PreflightError rather than letting the run proceed to the model.
-
-    Not vacuous, and distinct from the zero-tools path: the message must be the
-    connection-failure wording ("could not reach"), NOT the zero-tools wording.
-    Verified by replacing the httpx2.HTTPError branch's `raise` with `return []`
-    -- that made preflight_or_raise raise the ZERO-TOOLS message instead, so the
-    "could not reach" assertion below failed. So this test pins the connection
-    branch specifically, not merely a non-zero exit.
+    Pointing at a closed port makes the GET raise a ConnectError. The message must
+    be the connection-failure wording, not the zero-tools wording, pinning that branch.
     """
     # 127.0.0.1:1 has nothing listening; the SDK's short connect timeout applies.
     config = llm_agent.load_config(
@@ -567,13 +523,8 @@ def test_preflight_connection_error_refuses(capsys):
 def test_no_preflight_flag_skips_the_preflight(server, capsys):
     """--no-preflight (preflight=False) sends the completion with NO preflight GET.
 
-    Even when the gateway would report zero tools, --no-preflight proceeds to the
-    model -- the documented escape hatch (D6.22).
-
-    Not vacuous: the empty _gets assertion fails if the preflight ran anyway; the
-    single-POST assertion fails if the completion did not go out. Verified by
-    flipping preflight back to True here -> this test failed (a GET appeared and,
-    with zero tools, no POST did).
+    Even with zero tools reported, it proceeds to the model, the documented escape
+    hatch. Not vacuous: empty _gets fails if the preflight ran.
     """
     url, recorder = server
     recorder.preflight_tools = []  # would refuse if the preflight ran
@@ -594,8 +545,8 @@ def test_no_preflight_flag_skips_the_preflight(server, capsys):
 def test_preflight_url_derivation():
     """preflight_url strips a trailing /v1 and targets the origin sibling path.
 
-    Not vacuous: each assertion pins a specific derivation; a regression that
-    kept /v1 in the path, or hardcoded a host, changes the output and fails here.
+    Not vacuous: each assertion pins a specific derivation, so a regression that
+    kept /v1 or hardcoded a host changes the output and fails here.
     """
     assert (
         llm_agent.preflight_url("https://llm.example.com/v1")
@@ -613,19 +564,16 @@ def test_preflight_url_derivation():
 
 
 def test_main_skips_the_preflight_only_for_without_gate_token(server, monkeypatch, capsys):
-    """main() must wire --without-gate-token to preflight=False, and nothing else to it.
+    """main() wires --without-gate-token to preflight=False, and nothing else to it.
 
-    The other tests call run() directly, so a regression that dropped the
-    `and not args.without_gate_token` term would leave them all green while
-    silently breaking A16's demonstration: the preflight would refuse (zero tools
-    is the expected state there) and the model would never be asked. This drives
-    the real entry point instead, and pins the default the other way round too.
+    The other tests call run() directly, so this drives the real entry point and
+    pins both branches, which a dropped wiring term would silently break.
     """
     url, recorder = server  # the fixture default advertises a bouncer tool
     for key, value in _env(url, token=FAKE_TOKEN).items():
         monkeypatch.setenv(key, value)
 
-    # A16 path: no preflight GET, but the completion is still sent.
+    # Without-gate-token path: no preflight GET, but the completion is still sent.
     assert llm_agent.main(["--without-gate-token", "hi"]) == 0
     assert _gets(recorder) == []
     assert len(_posts(recorder)) == 1

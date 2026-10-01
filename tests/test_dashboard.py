@@ -1,24 +1,6 @@
-"""Static guards for the CloudWatch dashboard and its metric filters (R43,
-R58-R61, A17).
-
-These assert on committed Terraform text, not on a live dashboard. python-hcl2
-is not installed and this suite adds no dependency (R44), so the HCL is read as
-text and matched with narrow, commented regexes -- the same approach as
-tests/test_gateway_config.py.
-
-A recurring hazard with text guards is matching a word in a COMMENT rather than
-in a directive: an earlier guard in this repo passed vacuously because it matched
-its own explanatory comment. So the helpers here strip `#` comments before
-matching whenever a property could also be named in prose, and each guard was
-proven by breaking the property in a TEMP COPY of the guarded file (never the
-real one) and confirming the guard fails.
-
-What can and cannot be checked offline: these prove the committed HCL declares
-the intended resources, references (not literals), FILL-wrapped sparse metrics,
-target annotations, and comment-stripped metric-filter shapes. They CANNOT prove
-that a metric-math expression renders in the CloudWatch UI or that a metric ever
-carries data -- only a live dashboard shows that.
-"""
+"""Static guards for the CloudWatch dashboard and its metric filters.
+The HCL is read as text and matched with narrow regexes. To avoid matching a
+word in a comment, helpers strip `#` comments before matching where it matters."""
 
 from __future__ import annotations
 
@@ -35,13 +17,8 @@ MONITORING_TF = APP_TF_DIR / "monitoring.tf"
 
 def _strip_comments(text: str) -> str:
     """Drop whole-line and trailing `#` comments so a guard cannot match prose.
-
-    A line-oriented strip: it removes a `#` and everything after it on each line.
-    Limit: it does not understand a `#` inside a string literal, but none of the
-    guarded HCL puts a `#` inside a string (the markdown widget bodies use `##`
-    headers, which this would truncate -- so guards that must read markdown text
-    use the RAW text deliberately and say so).
-    """
+    It does not understand a `#` inside a string literal, but no guarded HCL puts
+    one there; markdown-body guards use the raw text instead and say so."""
     out = []
     for line in text.splitlines():
         h = line.find("#")
@@ -66,13 +43,13 @@ def _all_dashboard_text_raw() -> str:
 
 
 def test_dashboard_resource_exists_and_is_jsonencoded():
-    """R58: exactly one aws_cloudwatch_dashboard, body via jsonencode()."""
+    """Exactly one aws_cloudwatch_dashboard, body via jsonencode()."""
     text = _strip_comments(DASHBOARD_TF.read_text())
     header = re.search(r'resource\s+"aws_cloudwatch_dashboard"\s+"this"\s*\{', text)
     assert header, "no aws_cloudwatch_dashboard resource in dashboard.tf"
     # The body must be produced by jsonencode(...), not a raw heredoc string.
     assert re.search(r"dashboard_body\s*=\s*jsonencode\(", text), (
-        "dashboard_body must be built with jsonencode() (R58)"
+        "dashboard_body must be built with jsonencode()"
     )
     # Name derives from the project_name variable, not a literal.
     assert re.search(r"dashboard_name\s*=\s*var\.project_name", text), (
@@ -80,11 +57,11 @@ def test_dashboard_resource_exists_and_is_jsonencoded():
     )
 
 
-# --- no account id / region / arn / ip literal (R2, R3, R39) ----------------
+# --- no account id / region / arn / ip literal ----------------
 
 
 def test_no_twelve_digit_account_id_anywhere():
-    """R2/R39: no 12-digit AWS account id in any dashboard file (comments too)."""
+    """No 12-digit AWS account id in any dashboard file (comments too)."""
     for p in (DASHBOARD_TF, WIDGETS_TF, SLI_TF):
         raw = p.read_text()
         # A 12-digit run not part of a longer number. Account ids are exactly 12.
@@ -93,11 +70,8 @@ def test_no_twelve_digit_account_id_anywhere():
 
 
 def test_no_literal_region_string():
-    """R2/R3: no hardcoded region code (comments too).
-
-    Matches the region-code shape `xx-word-N`. The region must always come from
-    data.aws_region.current.region.
-    """
+    """No hardcoded region code (comments too). The region must always
+    come from data.aws_region.current.region."""
     pat = re.compile(r"\b[a-z]{2}-[a-z]+-\d\b")
     for p in (DASHBOARD_TF, WIDGETS_TF, SLI_TF):
         raw = p.read_text()
@@ -106,14 +80,14 @@ def test_no_literal_region_string():
 
 
 def test_no_literal_arn():
-    """R2/R39: no `arn:aws` literal; ARNs come from references (arn_suffix etc.)."""
+    """No `arn:aws` literal; ARNs come from references (arn_suffix etc.)."""
     for p in (DASHBOARD_TF, WIDGETS_TF, SLI_TF):
         raw = p.read_text()
         assert "arn:aws" not in raw, f"a literal arn:aws appears in {p.name}"
 
 
 def test_no_ip_literal():
-    """R2: no dotted-quad IP literal anywhere in the dashboard files."""
+    """No dotted-quad IP literal anywhere in the dashboard files."""
     pat = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
     for p in (DASHBOARD_TF, WIDGETS_TF, SLI_TF):
         raw = p.read_text()
@@ -122,7 +96,7 @@ def test_no_ip_literal():
 
 
 def test_region_is_the_data_source_reference():
-    """R2/R3: the region is data.aws_region.current.region (provider 6.x attr)."""
+    """The region is data.aws_region.current.region (provider 6.x attr)."""
     text = _all_dashboard_text()
     assert "data.aws_region.current.region" in text, (
         "the dashboard must take its region from data.aws_region.current.region"
@@ -134,10 +108,8 @@ def test_region_is_the_data_source_reference():
 
 def _metric_filter_block(text: str, resource_name: str) -> str:
     """Brace-matched body of a named aws_cloudwatch_log_metric_filter block.
-
-    Comments must be stripped by the caller if it wants to avoid matching prose;
-    this returns the slice verbatim from whatever text it is given.
-    """
+    Returns the slice verbatim; the caller strips comments if it needs to avoid
+    matching prose."""
     header = re.search(
         rf'resource\s+"aws_cloudwatch_log_metric_filter"\s+"{re.escape(resource_name)}"\s*\{{',
         text,
@@ -156,16 +128,13 @@ def _metric_filter_block(text: str, resource_name: str) -> str:
 
 
 def test_governance_filters_key_on_event_and_use_team_dimension():
-    """R58d/R60: the decision and fail-closed-per-team filters key on $.event and
-    use team as their only dimension -- never caller, tool or args_hash.
-
-    Comments are stripped first so a mention of `caller`/`tool`/`args_hash` in an
-    explanatory comment cannot make this pass or fail spuriously.
-    """
+    """The decision and fail-closed-per-team filters key on $.event and
+    use team as their only dimension, never caller, tool or args_hash. Comments
+    are stripped first so a mention in prose cannot flip the result."""
     text = _strip_comments(DASHBOARD_TF.read_text())
 
-    # Every metric filter for-each'd or named in dashboard.tf that carries a team
-    # dimension must key on $.event and must not name a forbidden field.
+    # Each named filter that carries a team dimension must key on $.event and
+    # must not name a forbidden field.
     named = [
         "decision_by_classification",
         "decision_by_outcome",
@@ -180,18 +149,14 @@ def test_governance_filters_key_on_event_and_use_team_dimension():
         )
         for forbidden in ("caller", "tool", "args_hash"):
             assert forbidden not in block, (
-                f"{name} must not reference {forbidden!r} (R33/R60 cardinality/leak)"
+                f"{name} must not reference {forbidden!r} (cardinality/leak)"
             )
 
 
 def test_no_forbidden_field_is_ever_a_dimension():
-    """R33/R60: caller, tool and args_hash never appear as a metric dimension.
-
-    Scans (comment-stripped) for a `$.caller` / `$.tool` / `$.args_hash` token in
-    any dimensions map. A JSON-field reference like `$.caller` only appears in a
-    metric-filter pattern or dimension; the governance patterns key on $.event
-    and $.classification / $.decision only, so any of these three is a red flag.
-    """
+    """Caller, tool and args_hash never appear as a metric dimension.
+    A `$.field` reference only shows up in a filter pattern or dimension, and the
+    governance patterns use only $.event, $.classification and $.decision."""
     text = _all_dashboard_text()
     for forbidden in (r"\$\.caller", r"\$\.tool\b", r"\$\.args_hash"):
         m = re.search(forbidden, text)
@@ -202,22 +167,14 @@ def test_no_forbidden_field_is_ever_a_dimension():
 
 
 def test_sparse_error_metrics_are_filled():
-    """A17: metrics that may never fire on a healthy stack are FILLed to 0.
-
-    Rather than enumerate every id, assert that each sparse SOURCE metric that
-    can be absent (5xx, server errors, throttles, per-team counts) is referenced
-    by a FILL() expression somewhere in the same file. The check: for a set of
-    metric names known to be sparse, the file both references the metric AND
-    contains at least one FILL( call, and no sparse metric is drawn as a bare
-    visible series.
-    """
+    """Metrics that may never fire on a healthy stack are FILLed to 0, so a
+    quiet minute reads 0 rather than 'no data'. Each known-sparse metric must be
+    a hidden source behind a FILL expression, never a bare visible series."""
     text = _all_dashboard_text()
-    assert "FILL(" in text, "no FILL() used at all -- sparse metrics would read 'no data' (A17)"
+    assert "FILL(" in text, "no FILL() used at all, so sparse metrics would read 'no data'"
 
-    # These metric names are emitted only on error/quiet paths (per the measured
-    # facts) and must never be a directly-visible series without FILL. We assert
-    # each appears only inside a hidden (visible = false) source entry, so its
-    # visible rendering is the FILLed math expression.
+    # These metrics fire only on error or quiet paths, so each must be a hidden
+    # (visible = false) source whose visible rendering is the FILLed expression.
     sparse = [
         "HTTPCode_ELB_5XX_Count",
         "HTTPCode_Target_5XX_Count",
@@ -228,12 +185,9 @@ def test_sparse_error_metrics_are_filled():
         "FailClosedByTeam",
     ]
     for name in sparse:
-        # Inspect only widget SOURCE-ARRAY lines: a metric array entry looks like
-        # `["AWS/...", "Metric", ...]` or `["${var.project_name}/gate", "Metric",
-        # ...]` and starts (after indentation) with `[`. The metric-filter
-        # DEFINITION lines (`name = "FailClosedByTeam"`) are not array entries and
-        # are excluded, so this does not false-positive on the filter that emits
-        # the metric.
+        # Inspect only widget source-array lines (they start with `[`), not the
+        # metric-filter definition lines, so this does not false-positive on the
+        # filter that emits the metric.
         for line in text.splitlines():
             stripped = line.strip()
             is_source_array = stripped.startswith("[") and (
@@ -249,11 +203,9 @@ def test_sparse_error_metrics_are_filled():
 
 
 def test_token_ratio_uses_fill_and_divide_guard():
-    """A17 + divide-by-zero: the output:input ratio FILLs and floors the divisor.
-
-    A ratio over a quiet minute must read 0, not error, so the denominator is
-    IF(x > 0, x, 1) (see test_no_max_of_a_series_and_a_scalar for why not MAX).
-    """
+    """FILL and divide-by-zero: the output:input ratio FILLs and floors the
+    divisor. A ratio over a quiet minute must read 0, not error, so the
+    denominator is IF(x > 0, x, 1), not MAX (see test_no_max_of_a_series...)."""
     text = _all_dashboard_text()
     assert re.search(
         r"FILL\(tr_out,\s*0\)\s*/\s*IF\(\(FILL\(tr_in,\s*0\)\)\s*>\s*0,\s*FILL\(tr_in,\s*0\),\s*1\)",
@@ -267,7 +219,7 @@ def test_token_ratio_uses_fill_and_divide_guard():
 
 
 def test_sli_targets_live_in_one_locals_block():
-    """R59: all targets are in one locals block, marked illustrative/provisional."""
+    """All targets are in one locals block, marked illustrative/provisional."""
     text = DASHBOARD_TF.read_text()  # raw: we want to read the comment too
     assert re.search(r"sli_targets\s*=\s*\{", text), "no sli_targets locals block"
     # The comment must mark targets illustrative and the latency ones provisional.
@@ -276,18 +228,14 @@ def test_sli_targets_live_in_one_locals_block():
 
 
 def test_every_sli_with_a_target_annotates_it_from_locals():
-    """R59: each SLI target is drawn as a horizontal annotation whose value comes
-    from local.sli_targets -- never a bare number.
-
-    Checks (comment-stripped) that every horizontal annotation value references
-    local.sli_targets, and that the five targeted SLIs are each present.
-    """
+    """Each SLI target is drawn as a horizontal annotation whose value comes
+    from local.sli_targets, never a bare number, and the five targeted SLIs are
+    each present."""
     text = _strip_comments(_all_dashboard_text())
 
-    # Every `value = ...` inside an annotations horizontal entry must reference
-    # local.sli_targets. Find each annotations block and assert it.
+    # Every horizontal annotation value must reference local.sli_targets.
     ann_values = re.findall(r"annotations\s*=\s*\{.*?horizontal\s*=\s*\[(.*?)\]", text, re.S)
-    assert ann_values, "no horizontal annotations found -- SLI targets are not drawn (R59)"
+    assert ann_values, "no horizontal annotations found, so SLI targets are not drawn"
     for chunk in ann_values:
         # Each entry has value = <expr>; that expr must mention local.sli_targets.
         for value_expr in re.findall(r"value\s*=\s*([^,}\n]+)", chunk):
@@ -304,12 +252,12 @@ def test_every_sli_with_a_target_annotates_it_from_locals():
         "gate_fail_closed_rate_pct",
     ):
         assert f"local.sli_targets.{key}" in text, (
-            f"SLI target {key} is never referenced by an annotation (R59)"
+            f"SLI target {key} is never referenced by an annotation"
         )
 
 
 def test_token_ratio_sli_has_no_target_annotation():
-    """R59: the output:input ratio is shown WITHOUT a target line."""
+    """The output:input ratio is shown WITHOUT a target line."""
     text = _strip_comments(_all_dashboard_text())
     # Locate the ratio SLI widget by its title and assert its slice has no
     # horizontal annotation. The widget title is distinctive.
@@ -320,7 +268,7 @@ def test_token_ratio_sli_has_no_target_annotation():
     nxt = re.search(r'title\s*=\s*"', after)
     window = after[: nxt.start()] if nxt else after
     assert "horizontal" not in window, (
-        "the output:input ratio SLI must not draw a target annotation (R59)"
+        "the output:input ratio SLI must not draw a target annotation"
     )
 
 
@@ -328,35 +276,28 @@ def test_token_ratio_sli_has_no_target_annotation():
 
 
 def test_absent_indicators_text_names_all_four():
-    """R61: the absences text names all four absent indicators with a reason.
-
-    Reads the RAW markdown body (the text widget content is prose, so comment
-    stripping would not help and could truncate the `##` headers).
-    """
+    """The absences text names all four absent indicators with a reason.
+    Reads the raw markdown body, since the content is prose and stripping could
+    truncate the `##` headers."""
     text = _all_dashboard_text_raw().lower()
-    # The four indicators R61 requires named.
+    # The four indicators the absences text must name.
     assert "time to first token" in text, "absences text must name time to first token"
     assert "fallback" in text, "absences text must name fallback engagement"
     assert "cache hit" in text, "absences text must name cache hit rate"
     assert "cost" in text, "absences text must name cost in currency"
-    # And the reasoning tokens for each (no streaming / one model / no caching /
-    # tokens shown instead).
+    # And a reason for each absence.
     assert "non-streaming" in text or "no streaming" in text or "not stream" in text
     assert "token" in text  # tokens shown instead of cost
 
 
 def test_model_indicators_documented_platform_wide():
-    """R60: the dashboard states, in a visible text widget, that model indicators
-    are platform-wide.
-
-    Checks the markdown widget BODIES only (lines containing `markdown` or inside
-    a heredoc), not comments -- a `platform-wide` mention buried in a `#` comment
-    would not satisfy R60, which is about what the dashboard shows a viewer.
-    """
+    """A visible text widget must state that model indicators are
+    platform-wide. Checks the markdown widget bodies only, since a mention buried
+    in a `#` comment would not be shown to a viewer."""
     raw = _all_dashboard_text_raw()
-    # Keep only lines that are part of a markdown body: either the single-line
-    # `markdown = "..."` form or lines inside a `markdown = <<-EOT ... EOT`
-    # heredoc. A small state machine tracks the heredoc.
+    # Keep only markdown-body lines: the single-line `markdown = "..."` form or
+    # lines inside a `markdown = <<-EOT ... EOT` heredoc, tracked by a state
+    # machine.
     body_lines: list[str] = []
     in_heredoc = False
     for line in raw.splitlines():
@@ -372,7 +313,7 @@ def test_model_indicators_documented_platform_wide():
             body_lines.append(line)
     body = "\n".join(body_lines).lower()
     assert "platform-wide" in body, (
-        "a visible text widget must state model-call indicators are platform-wide (R60)"
+        "a visible text widget must state model-call indicators are platform-wide"
     )
 
 
@@ -380,13 +321,9 @@ def test_model_indicators_documented_platform_wide():
 
 
 def test_existing_fail_closed_filter_is_unchanged():
-    """The existing fail_closed metric filter (monitoring.tf) keeps its exact
-    pattern and metric name; the dashboard must not have altered it.
-
-    Reads monitoring.tf directly and asserts the FailClosed filter's pattern and
-    metric name are exactly as they were. Comment-stripped so the assertion is on
-    the directive, not the surrounding prose (the comment names $.event too).
-    """
+    """The existing fail_closed metric filter in monitoring.tf keeps its exact
+    pattern and metric name, so the dashboard must not have altered it.
+    Comment-stripped so the assertion is on the directive, not the prose."""
     text = _strip_comments(MONITORING_TF.read_text())
     block = _metric_filter_block(text, "fail_closed")
     # Exact pattern on $.event = "fail_closed".
@@ -403,19 +340,14 @@ def test_existing_fail_closed_filter_is_unchanged():
 
 
 def test_dashboard_does_not_redefine_the_fail_closed_metric_name():
-    """The dashboard's per-team filter uses a DIFFERENT metric name so it cannot
-    clobber the existing FailClosed metric the alarm reads.
-
-    The per-team filter must be named FailClosedByTeam, and no metric_filter in
-    dashboard.tf may emit a metric literally named "FailClosed" (which would
-    collide with monitoring.tf's).
-    """
+    """The dashboard's per-team filter uses a different metric name so it cannot
+    clobber the FailClosed metric the alarm reads. It must be FailClosedByTeam,
+    and no dashboard.tf filter may emit a metric named exactly FailClosed."""
     text = _strip_comments(DASHBOARD_TF.read_text())
     # Find every metric_transformation name in dashboard.tf.
     names = re.findall(r'name\s*=\s*"([A-Za-z0-9_]+)"', text)
-    # FailClosedByTeam must exist; a bare FailClosed metric_transformation must not
-    # (the dashboard only READS FailClosed by string in a widget, never redefines
-    # it as a filter output).
+    # FailClosedByTeam must exist; the dashboard only reads FailClosed by string
+    # in a widget, never redefines it as a filter output.
     assert "FailClosedByTeam" in names, "the per-team fail-closed filter must exist"
     # Ensure no metric_transformation emits exactly "FailClosed" in dashboard.tf.
     for block_name in ("decision_by_classification", "decision_by_outcome",
@@ -427,34 +359,15 @@ def test_dashboard_does_not_redefine_the_fail_closed_metric_name():
         )
 
 
-# --- substantive-content guards (harden beyond pure structure) --------------
-#
-# The structural guards above prove the dashboard is shaped right (resources,
-# jsonencode, references-not-literals, FILL, annotations). They would NOT catch a
-# well-formed-but-WRONG dimension set, a mis-wired availability formula, or a
-# governance row that silently dropped a table or a service. These guards assert
-# the substance: the specific dimension families Service Connect actually
-# publishes, the SLI arithmetic, and that both tables + both services are drawn.
+# Substantive-content guards. The structural guards above prove the dashboard is
+# shaped right but would not catch a well-formed but wrong dimension set, a
+# mis-wired formula, or a dropped table or service. These assert that substance.
 
 
 def test_service_connect_target_metrics_use_a_published_dimension_set():
-    """A17: the Service Connect TARGET-attributed metrics
-    (HTTPCode_Target_2XX/4XX/5XX_Count, TargetResponseTime) must be queried on a
-    PUBLISHED dimension set, else they render 'no data' and FILL cannot rescue
-    them (FILL fills gaps in a metric that resolves, not one that matches
-    nothing).
-
-    AWS publishes these on `TargetDiscoveryName` alone OR on
-    `TargetDiscoveryName, ServiceName, ClusterName` where ServiceName is the
-    CALLING (client) service. The set `(ClusterName, ServiceName=gate,
-    TargetDiscoveryName)` -- pairing a target metric with the gate's OWN
-    ServiceName -- is NOT published. This guard fails if any target-metric source
-    array names ServiceName while using TargetDiscoveryName (the wrong shape the
-    reviewer flagged), and passes only when the target metrics stand on
-    TargetDiscoveryName without a gate ServiceName.
-
-    Ref: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/available-metrics.html
-    """
+    """Target-attributed metrics must query a published dimension set, or
+    they render 'no data' and FILL cannot rescue a metric that matches nothing.
+    Pairing a target metric with the gate's own ServiceName is not published."""
     text = _strip_comments(_all_dashboard_text())
     target_metrics = (
         "HTTPCode_Target_2XX_Count",
@@ -465,8 +378,7 @@ def test_service_connect_target_metrics_use_a_published_dimension_set():
         stripped = line.strip()
         if not stripped.startswith("["):
             continue
-        # Only the ECS Service Connect target series (not the ALB ones, which
-        # legitimately pair TargetGroup with LoadBalancer).
+        # Only the ECS Service Connect target series, not the ALB ones.
         if '"AWS/ECS"' not in stripped:
             continue
         names_here = [m for m in target_metrics if f'"{m}"' in stripped]
@@ -478,9 +390,8 @@ def test_service_connect_target_metrics_use_a_published_dimension_set():
         assert '"TargetDiscoveryName"' in stripped, (
             f"ECS target metric {names_here} must query TargetDiscoveryName: {stripped!r}"
         )
-        # Must NOT also carry ServiceName -- that would be the unpublished
-        # gate-ServiceName shape (or force a client ServiceName we can't rely on
-        # for a client-only Service Connect config).
+        # Must not also carry ServiceName, which would be the unpublished
+        # gate-ServiceName shape.
         assert '"ServiceName"' not in stripped, (
             f"ECS target metric {names_here} must not pair TargetDiscoveryName with "
             f"ServiceName (unpublished dimension set): {stripped!r}"
@@ -488,11 +399,9 @@ def test_service_connect_target_metrics_use_a_published_dimension_set():
 
 
 def test_service_connect_requestcount_uses_server_side_set():
-    """The inbound RequestCount (server-side) uses the published
-    `DiscoveryName, ServiceName, ClusterName` set (ServiceName = the gate server),
-    NOT a TargetDiscoveryName. This is the counterpart to the target-metric guard
-    and keeps the two families from being swapped.
-    """
+    """The inbound RequestCount (server-side) uses the published DiscoveryName,
+    ServiceName, ClusterName set with ServiceName as the gate server, not a
+    TargetDiscoveryName, keeping the two metric families from being swapped."""
     text = _strip_comments(_all_dashboard_text())
     found = False
     for line in text.splitlines():
@@ -516,12 +425,9 @@ def test_service_connect_requestcount_uses_server_side_set():
 
 
 def test_availability_formula_divides_5xx_by_request_count():
-    """R59: gateway availability is 1 - (Target_5XX + ELB_5XX)/RequestCount.
-
-    Asserts the availability SLI expression combines BOTH 5xx sources over
-    RequestCount (via the FILLed ids), not something structurally-plausible but
-    arithmetically wrong. Checked on both the time-series and single-value forms.
-    """
+    """Gateway availability is 1 - (Target_5XX + ELB_5XX)/RequestCount.
+    Asserts the SLI expression combines both 5xx sources over RequestCount via
+    the FILLed ids, not something plausible but arithmetically wrong."""
     text = _strip_comments(_all_dashboard_text())
     # The availability time series (av_*). The single-value attainment widget
     # was removed at the owner's request.
@@ -547,13 +453,9 @@ def test_availability_formula_divides_5xx_by_request_count():
 
 
 def test_fail_closed_rate_denominator_is_decisions_plus_fail_closed():
-    """R59: per-team fail-closed rate = fc / (pass + approve + block + fc).
-
+    """Per-team fail-closed rate = fc / (pass + approve + block + fc).
     A fail-closed writes no decision line, so the denominator is the three
-    decision outcomes for the team plus the team's fail-closed count. Assert the
-    expression sums exactly those four FILLed ids in the divisor and the fc id in
-    the numerator, per team index.
-    """
+    decision outcomes plus the team's fail-closed count, all FILLed."""
     text = _strip_comments(_all_dashboard_text())
     # The expression is built in a for-comprehension, so the team index is the
     # literal interpolation ${ti}, not a resolved number. Match that form, with
@@ -577,14 +479,11 @@ def test_fail_closed_rate_denominator_is_decisions_plus_fail_closed():
 
 
 def test_both_dynamodb_tables_and_both_services_are_referenced():
-    """R58a: the platform row draws BOTH DynamoDB tables and BOTH ECS services.
-
-    A structural guard would pass even if a table or a service were quietly
-    dropped. Assert each of the four provenance locals is referenced in the
-    dashboard widgets (comment-stripped, so a mention in prose does not count).
-    """
+    """R58a: the platform row draws both DynamoDB tables and both ECS services.
+    A structural guard would pass even if one were dropped, so assert each of the
+    four provenance locals is referenced (comment-stripped, so prose does not count)."""
     text = _strip_comments(_all_dashboard_text())
-    # Per metric family, not anywhere in the text: a reference surviving in one
+    # Checked per metric family, so a reference surviving in one
     # widget must not mask the same table or service vanishing from another.
     families = {
         '"ThrottledRequests"': ("local.approvals_table", "local.audit_table"),
@@ -594,19 +493,18 @@ def test_both_dynamodb_tables_and_both_services_are_referenced():
     }
     for metric, refs in families.items():
         lines = [line for line in text.splitlines() if metric in line]
-        assert lines, f"no {metric} series in the dashboard (R58a)"
+        assert lines, f"no {metric} series in the dashboard"
         for ref in refs:
             assert any(ref in line for line in lines), (
-                f"{metric} never draws {ref} -- a table or service is missing "
-                f"from the platform row (R58a)"
+                f"{metric} never draws {ref}: a table or service is missing "
+                f"from the platform row"
             )
 
 
 def test_unattributed_fail_closed_uses_total_minus_per_team():
-    """A17: null-team fail-closed blocks are still counted. The governance row
+    """Null-team fail-closed blocks are still counted. The governance row
     computes unattributed = max(total FailClosed - sum(per-team), 0), reading the
-    UNdimensioned FailClosed total so a team=null block is not silently dropped.
-    """
+    undimensioned FailClosed total so a team=null block is not dropped."""
     text = _strip_comments(_all_dashboard_text())
     # The unattributed expression subtracts the per-team FILLed sum from the total
     # FailClosed (mfct) and floors at 0.
@@ -623,14 +521,9 @@ def test_unattributed_fail_closed_uses_total_minus_per_team():
 
 
 def test_no_max_of_a_series_and_a_scalar():
-    """CloudWatch rejects MAX([series, scalar]).
-
-    Measured with GetMetricData against the live account: `MAX([FILL(m,0), 1])`
-    fails with "Unsupported operand type(s) for MAX: Array[TimeSeries, Scalar]".
-    MAX over an array accepts time series only. A dashboard using it applies
-    cleanly and then renders an error in every widget that divides by a floored
-    count. Floors are written IF(x > 0, x, 1) instead, which was accepted.
-    """
+    """CloudWatch rejects MAX([series, scalar]): MAX over an array accepts time
+    series only, so a dashboard using it renders an error in every widget that
+    divides by a floored count. Floors are written IF(x > 0, x, 1) instead."""
     text = _strip_comments(_all_dashboard_text())
     assert "MAX([" not in text, (
         "MAX([...]) mixing a series and a scalar is rejected by CloudWatch; "
@@ -639,11 +532,9 @@ def test_no_max_of_a_series_and_a_scalar():
 
 
 def test_section_headers_are_four_words_or_fewer():
-    """Owner's rule: section headers are labels, four words at most.
-
-    The text widgets that open each row carry only a `## ` heading; longer prose
-    belongs in DESIGN.md, not on the dashboard.
-    """
+    """Owner's rule: section headers are labels, four words at most. The text
+    widgets that open each row carry only a `## ` heading. Longer prose belongs
+    in DESIGN.md."""
     raw = _all_dashboard_text_raw()
     headers = re.findall(r"^\s*(?:markdown\s*=\s*\")?##\s+([^\"\n]+)", raw, re.M)
     assert len(headers) >= 6, f"expected six section headers, found {headers!r}"

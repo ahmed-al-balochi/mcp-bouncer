@@ -1,16 +1,7 @@
 """A minimal MCP client for driving the demo by hand.
 
-This plays the agent's part in the two-terminal demo: it connects to the running
-gate over HTTP, calls one tool, and prints the outcome. It exists so a reviewer
-can exercise the park -> notify -> retry loop without writing code.
-
-The `--token` flag is not decoration. Over HTTP the gate requires an
-`Authorization: Bearer` token and has no fallback, because an HTTP listener is
-reachable across a network boundary and an unauthenticated caller is an
-unidentified one. Over stdio the gate trusts `--caller` instead, since there the
-client spawned the server process and the two are the same trust domain -- but a
-stdio server can only be spoken to by whoever spawned it, which is why this
-client speaks HTTP and therefore needs a token.
+It connects to the gate over HTTP, calls one tool, and prints the outcome. Over
+HTTP the gate requires a bearer token, since the listener crosses a network.
 """
 
 from __future__ import annotations
@@ -69,7 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not token:
         parser.error(
             "the gate requires a bearer token over HTTP; pass --token or set "
-            f"${TOKEN_ENV}. The token must be one the running gate knows -- see "
+            f"${TOKEN_ENV}. The token must be one the running gate knows. See "
             "the README's demo section."
         )
 

@@ -1,26 +1,7 @@
 """A DynamoDB-backed decision log, append-only like the SQLite one.
 
-Why this exists: with the gate scaled across hosts there is no shared file to
-hold the audit trail, so the log moves to DynamoDB alongside the approvals (R29).
-
-Append-only is enforced the same way it is for SQLite -- structurally. This
-class only ever issues PutItem and Query, and exposes no update, delete, clear
-or truncate method. In the deployed system that is backed by IAM: the task role
-is granted PutItem and Query on this table and nothing that mutates or removes an
-existing item, so even a compromised process cannot rewrite history.
-
-boto3 is imported lazily inside `__init__` so that importing this module, and
-the entire SQLite path, never require boto3 (R44).
-
-Key schema (single table):
-
-    Entry   PK = AUDIT            SK = <recorded_at, zero-padded>#<uuid>
-            recorded_at, caller, tool, classification, decision, args_hash
-
-Entries share one partition keyed by a constant, with a time-ordered sort key, so
-`entries` is a single Query in sort order -- newest first via ScanIndexForward
-false -- rather than a Scan. The uuid suffix keeps two entries written in the
-same microsecond from colliding on one sort key.
+Append-only is structural (only PutItem and Query) and backed by IAM.
+boto3 is imported lazily so the SQLite path never needs it.
 """
 
 from __future__ import annotations
@@ -46,7 +27,7 @@ class DynamoDBAuditLog:
         clock: Callable[[], float] = time.time,
         region_name: str | None = None,
     ) -> None:
-        # Lazy import: boto3 is an optional extra (R44). Selecting the DynamoDB
+        # Lazy import: boto3 is an optional extra. Selecting the DynamoDB
         # backend without installing it fails here with an actionable message.
         try:
             import boto3
@@ -90,9 +71,8 @@ class DynamoDBAuditLog:
     def entries(self, limit: int = 100) -> list[AuditEntry]:
         """Return the most recent entries, oldest first.
 
-        Query the single audit partition newest-first, cap at `limit`, then
-        reverse so the caller sees oldest-first -- the same ordering contract the
-        SQLite log provides.
+        Query the partition newest-first, cap at `limit`, then reverse so the
+        caller sees oldest-first, matching the SQLite log's ordering.
         """
         response = self._client.query(
             TableName=self._table,

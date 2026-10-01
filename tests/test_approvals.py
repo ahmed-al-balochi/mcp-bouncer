@@ -142,26 +142,15 @@ def test_releases_outside_the_window_no_longer_count(make_approvals):
     assert store.approved_in_window(CALLER) == 0
 
 
-# --- per-row (per-team) approval TTL, R26 / bug D5.2 ----------------------
-#
-# The store default TTL in these fixtures is 10 minutes (registry baseline).
-# A per-row TTL of 5 minutes stands in for a team like CustomerChat that
-# tightened its approval window below the baseline. Each test advances the fake
-# clock into the gap BETWEEN the short TTL and the default: without the fix the
-# grant is written with the store default and survives that gap, so every
-# assertion here fails on the unfixed code. Both backends run each test.
+# Per-row (per-team) approval TTL. The store default is 10 minutes. A
+# 5-minute per-row TTL stands in for a team that tightened its window. Each test
+# advances the clock into the gap between the two to catch a grant that ignores it.
 
 SHORT_TTL_SECONDS = 5 * 60.0  # a team-tightened 5 minutes; baseline is 10
 
 
 def test_a_short_ttl_grant_cannot_be_consumed_past_its_own_ttl(make_approvals):
-    """create(ttl_seconds=5min) + approve => grant dies at 5 min, not the 10 default.
-
-    Advance past the stamped 5-minute TTL but well before the 10-minute store
-    default. On the fixed code the grant expired at 5 minutes and cannot be
-    consumed; on the unfixed code it was written with the 10-minute default and
-    would still release here.
-    """
+    """A 5-minute grant dies at 5 minutes, not at the 10-minute store default."""
     clock = _Clock()
     store = make_approvals(clock=clock)
     parked = store.create(CALLER, TOOL, PAGE_7, ttl_seconds=SHORT_TTL_SECONDS)
@@ -172,11 +161,7 @@ def test_a_short_ttl_grant_cannot_be_consumed_past_its_own_ttl(make_approvals):
 
 
 def test_a_short_ttl_grant_is_still_consumable_before_its_ttl(make_approvals):
-    """Control: within the stamped 5 minutes the grant is still good.
-
-    Proves the tightening did not simply kill the grant outright -- it lives
-    exactly as long as the stamped TTL says, no less.
-    """
+    """Control: within the stamped 5 minutes the grant is still good."""
     clock = _Clock()
     store = make_approvals(clock=clock)
     parked = store.create(CALLER, TOOL, PAGE_7, ttl_seconds=SHORT_TTL_SECONDS)
@@ -187,11 +172,8 @@ def test_a_short_ttl_grant_is_still_consumable_before_its_ttl(make_approvals):
 
 
 def test_a_default_ttl_grant_still_lives_the_full_default(make_approvals):
-    """Control: with no stamped TTL the grant still lives the store default.
-
-    The gap the short-TTL test dies in is the SAME gap this baseline grant
-    survives, so the two together prove the TTL is per-row and not global.
-    """
+    """Control: with no stamped TTL the grant lives the full store default, in
+    the same gap the short-TTL grant dies in, proving the TTL is per-row."""
     clock = _Clock()
     store = make_approvals(clock=clock)
     parked = store.create(CALLER, TOOL, PAGE_7)  # no ttl_seconds => default
@@ -202,12 +184,7 @@ def test_a_default_ttl_grant_still_lives_the_full_default(make_approvals):
 
 
 def test_a_pending_row_with_a_short_ttl_expires_on_its_own_schedule(make_approvals):
-    """expire() must retire a short-TTL PENDING row at its own TTL, not the default.
-
-    Park with a 5-minute TTL, never approve, advance past 5 minutes (before the
-    10-minute default) and sweep. On the fix the row is gone from list_pending;
-    on the unfixed code expire() used the store default and the row survives.
-    """
+    """expire() retires a short-TTL pending row at its own TTL, not the default."""
     clock = _Clock()
     store = make_approvals(clock=clock)
     parked = store.create(CALLER, TOOL, PAGE_7, ttl_seconds=SHORT_TTL_SECONDS)
@@ -230,13 +207,9 @@ def test_a_pending_row_with_a_short_ttl_survives_before_its_ttl(make_approvals):
 
 
 def test_dedup_reuse_tightens_a_stored_ttl_but_never_loosens_it(make_approvals):
-    """The dedup path keeps the STRICTER of the two TTLs, never the looser.
-
-    First park with the baseline default (looser), then an identical call with a
-    5-minute TTL (stricter): the reused row must end up at 5 minutes. Then park
-    the same call again with the default: the row must stay at 5 minutes, because
-    reuse may only tighten. Approve and check the grant dies at 5 minutes.
-    """
+    """The dedup path keeps the stricter of the two TTLs and never loosens it:
+    park at the default, then at 5 minutes, then the default again, and the
+    reused row stays at 5 minutes."""
     clock = _Clock()
     store = make_approvals(clock=clock)
 
@@ -253,12 +226,8 @@ def test_dedup_reuse_tightens_a_stored_ttl_but_never_loosens_it(make_approvals):
 
 
 def test_approve_reports_the_stamped_ttl_lifetime(make_approvals):
-    """approve() returns the resolved grant lifetime so the CLI can print it.
-
-    A stamped 5-minute TTL comes back as ttl_seconds == 300 on the approved
-    record; a row with no stamped TTL comes back as the store default. This is
-    the value the CLI turns into "within N minutes".
-    """
+    """approve() returns the resolved grant lifetime so the CLI can print it: a
+    stamped 5-minute TTL comes back as 300, an unstamped row as the default."""
     store = make_approvals()
     parked = store.create(CALLER, TOOL, PAGE_7, ttl_seconds=SHORT_TTL_SECONDS)
     granted = store.approve(parked.id)
@@ -271,11 +240,9 @@ def test_approve_reports_the_stamped_ttl_lifetime(make_approvals):
     assert granted_default.ttl_seconds == store.ttl_seconds
 
 
-# --- SQLite schema migration for the new per-row TTL column (R26) ----------
-#
-# These reach past the shared contract to the SQLite backend specifically,
-# because the migration is a SQLite concern (DynamoDB is schemaless). They use
-# the SqliteApprovalStore directly rather than the parametrised fixture.
+# SQLite schema migration for the new per-row TTL column. These reach past
+# the shared contract to the SQLite backend because the migration is a SQLite
+# concern (DynamoDB is schemaless), so they use SqliteApprovalStore directly.
 
 import sqlite3
 
@@ -305,13 +272,7 @@ def _legacy_pending_schema(path) -> None:
 
 
 def test_opening_a_pre_ttl_database_adds_the_column_idempotently(db_path):
-    """The migration adds `ttl_seconds` to an old table, and re-opening is a no-op.
-
-    Simulates a database written before this change (no ttl_seconds column).
-    Opening the store must add the nullable column; opening it a second time must
-    not fail (idempotent), matching how the existing schema is created on every
-    boot.
-    """
+    """The migration adds `ttl_seconds` to an old table, and re-opening is a no-op."""
     _legacy_pending_schema(db_path)
 
     SqliteApprovalStore(db_path, ttl_minutes=10)  # first open: migrates
@@ -326,12 +287,9 @@ def test_opening_a_pre_ttl_database_adds_the_column_idempotently(db_path):
 
 
 def test_a_legacy_row_without_a_ttl_falls_back_to_the_store_default(db_path):
-    """A pending row written before the migration (NULL ttl_seconds) uses the default.
-
-    Insert a row directly with no TTL after migrating, then approve it: the grant
-    must live the store default, so it is still consumable in the gap a stamped
-    short TTL would have died in.
-    """
+    """A pending row written before the migration (NULL ttl_seconds) uses the
+    store default when approved, so it stays consumable in the gap a stamped
+    short TTL would have died in."""
     clock = _Clock()
     store = SqliteApprovalStore(db_path, ttl_minutes=10, clock=clock)
     # Insert a legacy-style pending row directly, leaving ttl_seconds NULL.

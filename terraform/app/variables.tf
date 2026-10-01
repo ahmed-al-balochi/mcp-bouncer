@@ -1,9 +1,6 @@
-# All environment-specific values are variables with no default that leaks the
-# owner's setup (R39). Defaults exist only where they are generic to the project
-# (project_name, task size, log retention) or discovered at apply time
-# (allowed_cidrs). The domain, alert email, and any account-specific value are
-# required with no default and are supplied through a gitignored terraform.tfvars
-# or TF_VAR_* (R2, R3).
+# All environment-specific values are variables. Defaults exist only where they
+# are generic to the project or discovered at apply time; the domain, alert email
+# and any account-specific value are required and supplied via gitignored tfvars.
 
 variable "aws_region" {
   description = "Region for every resource in this stack. Must match the region the bootstrap ECR repository and ACM certificate live in."
@@ -30,11 +27,7 @@ variable "dns_zone_name" {
   description = <<-EOT
     Fully qualified name of the delegated DNS zone created by the bootstrap
     stack, e.g. "bouncer.example.com". The gateway is served at
-    `$${gateway_host_label}.$${dns_zone_name}` (default `llm.<zone>`, D6.10), not
-    at the apex: G1 removed the apex A alias (dns.tf). The bootstrap certificate
-    is a wildcard (`*.<zone>`, bootstrap certificate.tf) so it already covers the
-    gateway host and no certificate change is needed. No default -- a reader
-    supplies their own (R3).
+    `$${gateway_host_label}.$${dns_zone_name}` (default `llm.<zone>`), not the apex.
   EOT
   type        = string
 
@@ -46,9 +39,9 @@ variable "dns_zone_name" {
 
 variable "alert_email" {
   description = <<-EOT
-    Email address that receives the fail_closed CloudWatch alarm via SNS. No
-    default (R2, R39). After apply, AWS sends a confirmation link to this address
-    that MUST be clicked before any alarm notification is delivered.
+    Email address that receives the fail_closed CloudWatch alarm via SNS. After
+    apply, AWS sends a confirmation link to this address that must be clicked
+    before any alarm notification is delivered.
   EOT
   type        = string
 
@@ -63,9 +56,9 @@ variable "alert_email" {
 
 variable "allowed_cidrs" {
   description = <<-EOT
-    Source IP CIDRs permitted to reach the ALB (R37). Default null means:
-    discover the applier's own public IP at apply time and allow only <ip>/32.
-    Override with an explicit list to allowlist known operator networks.
+    Source IP CIDRs permitted to reach the ALB. Default null means: discover the
+    applier's own public IP at apply time and allow only <ip>/32. Override with
+    an explicit list to allowlist known operator networks.
   EOT
   type        = list(string)
   default     = null
@@ -92,7 +85,7 @@ variable "image_tag" {
 }
 
 variable "litellm_image_tag" {
-  description = "Tag of the thin LiteLLM gateway image in the bootstrap litellm ECR repository to run (G1, D6.10)."
+  description = "Tag of the thin LiteLLM gateway image in the bootstrap litellm ECR repository to run."
   type        = string
   default     = "latest"
 
@@ -104,28 +97,24 @@ variable "litellm_image_tag" {
 
 variable "bedrock_inference_profile_id" {
   description = <<-EOT
-    Bedrock inference profile id the gateway routes to (R53, D6.10). Must be an
-    EU (`eu.`) profile so models stay EU-only; the aws_bedrock_inference_profile
-    data source is keyed by this, and a lifecycle postcondition additionally
-    asserts every routed foundation-model region begins with `eu-`. This is
-    project design, not an environment value (it matches the model id in
-    gateway/litellm.yaml), so a default is appropriate.
+    Bedrock inference profile id the gateway routes to. Must be an EU (`eu.`)
+    profile so models stay EU-only; the data source is keyed by this and a
+    lifecycle postcondition asserts every routed model region begins with `eu-`.
   EOT
   type        = string
   default     = "eu.anthropic.claude-sonnet-5"
 
   validation {
     condition     = startswith(var.bedrock_inference_profile_id, "eu.")
-    error_message = "bedrock_inference_profile_id must be an EU inference profile (start with \"eu.\") so models stay EU-only (R53)."
+    error_message = "bedrock_inference_profile_id must be an EU inference profile (start with \"eu.\") so models stay EU-only."
   }
 }
 
 variable "gateway_host_label" {
   description = <<-EOT
-    DNS label for the gateway host under the delegated zone (D6.10): the ALB
-    serves the gateway at `$${gateway_host_label}.$${dns_zone_name}` and nothing
-    else. Default "llm". A label, not a full name -- the zone name is a separate
-    variable -- so no domain is hardcoded here (R3).
+    DNS label for the gateway host under the delegated zone: the ALB serves the
+    gateway at `$${gateway_host_label}.$${dns_zone_name}` and nothing else.
+    Default "llm". A label, not a full name, so no domain is hardcoded here.
   EOT
   type        = string
   default     = "llm"
@@ -139,7 +128,7 @@ variable "gateway_host_label" {
 }
 
 variable "vpc_cidr" {
-  description = "CIDR block for the dedicated VPC (D4.4). Large enough for two public and two private /24 subnets."
+  description = "CIDR block for the dedicated VPC. Large enough for two public and two private /24 subnets."
   type        = string
   default     = "10.0.0.0/16"
 
@@ -168,10 +157,8 @@ variable "log_retention_days" {
 variable "callers" {
   description = <<-EOT
     Map of caller name => team name. One bearer token is generated per entry and
-    written into the token secret as { <token> = { caller = <name>, team =
-    <team> } } (see secrets.tf). Every team named here MUST exist in policy.yaml
-    or the gate refuses to boot; a precondition in secrets.tf enforces that at
-    plan time rather than as a task crash-loop.
+    written into the token secret (see secrets.tf). Every team named here must
+    exist in policy.yaml or the gate refuses to boot; a precondition checks it.
   EOT
   type        = map(string)
   default = {

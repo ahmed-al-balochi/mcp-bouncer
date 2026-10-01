@@ -1,14 +1,6 @@
 """End-to-end identity and per-team policy, through the real HTTP proxy.
-
-Unlike test_lifecycle.py, which drives the gate over the in-memory transport
-(the stdio-equivalent trusted path), these tests stand the gate up on a real
-HTTP listener and speak to it across a socket. That is the only way to exercise
-the bearer-token path honestly: identity is authenticated from an
-`Authorization` header that genuinely crossed the transport, not injected into a
-function call. A6 and A7 are proven here against a running server.
-
-No AWS, no external network: the token source is the local `BOUNCER_TOKENS`
-env var and the listener is on loopback (R45).
+Unlike test_lifecycle.py, these speak to a real HTTP listener over a socket, the
+only honest way to exercise the bearer-token path, with no AWS or external network.
 """
 
 from __future__ import annotations
@@ -56,10 +48,8 @@ def http_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ) -> Iterator[str]:
     """Run the gate over real HTTP with the bearer-token identity source.
-
     Yields the MCP endpoint URL. The server runs in a daemon thread on its own
-    asyncio loop; the test process is the client. The DB is a fresh file per
-    test so approvals do not bleed between tests.
+    loop; the DB is a fresh file per test so approvals do not bleed across tests.
     """
     monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
     db_path = tmp_path / "http-gate.db"
@@ -111,30 +101,24 @@ def call(
     return asyncio.run(_call())
 
 
-# Under the amended R18, HTTP auth is enforced on the WHOLE session by fastmcp's
-# native auth seam, which runs before the MCP session manager. So a request
-# without a valid token cannot even `initialize`: the client raises an
-# MCPError/transport error during session setup rather than returning an error
-# ToolResult. `session_rejected` captures that "the door never opened" outcome,
-# which is stronger than the old "the call returned BLOCKED" outcome and is
-# exactly what A6 (amended) requires.
+# HTTP auth is enforced on the whole session before the
+# session manager, so a request without a valid token cannot even initialize:
+# the client raises during setup rather than returning an error ToolResult.
 SESSION_REJECTED = (MCPError, ClientError)
 
 
 def initialize_rejected(url: str, token: str | None) -> bool:
     """True iff a session with this token cannot initialize or list tools.
-
-    Exercises the two session operations R18 now covers -- `initialize` and
-    `tools/list` -- not a tool call, because the point is that the catalogue is
-    unreachable without a token, not merely that a call is blocked.
+    Exercises the two session operations, initialize and tools/list,
+    because the point is that the catalogue is unreachable without a token.
     """
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
 
     async def _run() -> Any:
         transport = StreamableHttpTransport(url, headers=headers)
         async with Client(transport) as client:
-            # Entering the context performs `initialize`; list_tools is the
-            # catalogue read. Either failing before returning is a rejection.
+            # Entering the context performs initialize; list_tools reads the
+            # catalogue. Either failing before returning is a rejection.
             return await client.list_tools()
 
     try:
@@ -154,13 +138,13 @@ def approval_id_from(result: Any) -> str:
     return message.split(f"{APPROVAL_REQUIRED} id=")[1].split()[0]
 
 
-# --- rejection at the door (A6, amended R18: the SESSION, not just the call) --
+# --- rejection at the door (the SESSION, not just the call) --
 
 
 def test_a_session_with_no_token_cannot_initialize_or_list_tools(http_gate: str):
     """No Authorization header: the session never initializes, so the catalogue
     is unreachable. This is stronger than the old "the tool call is blocked":
-    an unauthenticated client cannot even discover what tools exist (R18)."""
+    an unauthenticated client cannot even discover what tools exist."""
     assert initialize_rejected(http_gate, None) is True
 
 
@@ -187,13 +171,11 @@ def test_a_malformed_authorization_header_is_rejected(http_gate: str):
             asyncio.run(_run())
             return False
         except SESSION_REJECTED:
-            # Rejected server-side: the token verifier returned no identity, so
-            # the session was refused with a 401.
+            # Rejected server-side: the verifier returned no identity, 401.
             return True
         except (RuntimeError, ValueError):
-            # Rejected client-side: an empty `Bearer ` is an illegal HTTP header
-            # value, so the client refuses to even transmit it. Either way no
-            # session is established, which is the property under test.
+            # Rejected client-side: an empty Bearer is an illegal header value,
+            # so the client refuses to transmit it. Either way, no session.
             return True
 
     # Wrong scheme: server-side rejection.
@@ -220,10 +202,9 @@ def test_a_valid_token_initializes_lists_tools_and_reads(http_gate: str):
 def test_the_read_call_records_the_authenticated_caller(
     http_gate: str, tmp_path: Path
 ):
-    """The caller the middleware resolves from the SAME Authorization header the
-    session verifier accepted is the one attributed in the audit log -- proving
-    the header reaches on_call_tool's get_http_headers even with the auth
-    middleware installed (defence in depth is intact)."""
+    """The caller resolved from the same Authorization header the session
+    verifier accepted is the one attributed in the audit log, proving the header
+    reaches on_call_tool even with the auth middleware installed."""
     db_path = tmp_path / "http-gate.db"
     result = call(http_gate, DEV_TOKEN, "wiki.read_page", {"title": "home"})
     assert result.is_error is False
@@ -234,13 +215,13 @@ def test_the_read_call_records_the_authenticated_caller(
     assert reads[-1].caller == "dev-agent"
 
 
-# --- the tightening override takes effect end to end (R23, R24) -----------
+# --- the tightening override takes effect end to end -----------
 
 
 def test_a_write_parks_for_customerchat_but_passes_for_devchat(http_gate: str):
     """wiki.write_page is `write` at baseline: DevChat passes it, CustomerChat
     (which promotes it to destructive) parks it. Same tool, same arguments, two
-    teams, two outcomes -- proven through the real proxy."""
+    teams, two outcomes, proven through the real proxy."""
     dev = call(http_gate, DEV_TOKEN, "wiki.write_page", {"title": "n", "body": "b"})
     assert dev.is_error is False
 
@@ -254,14 +235,14 @@ def test_a_write_parks_for_customerchat_but_passes_for_devchat(http_gate: str):
     assert "expires in 5 minutes" in message
 
 
-# --- the two callers' destructive counters are independent (A6) -----------
+# --- the two callers' destructive counters are independent -----------
 
 
 def test_two_callers_have_independent_destructive_counters(
     http_gate: str, tmp_path: Path, policy_path: Path
 ):
     """DevChat's cap is 2. The dev caller uses up its own allowance; the customer
-    caller, on a different identity, is unaffected -- its own (tighter) cap of 1
+    caller, on a different identity, is unaffected. Its own (tighter) cap of 1
     still has room. Counters keyed per caller, not shared."""
     db_path = tmp_path / "http-gate.db"
 
@@ -300,7 +281,7 @@ def test_two_callers_have_independent_destructive_counters(
     assert APPROVAL_REQUIRED in text_of(customer)
 
 
-# --- tokens never leak (A6 security property) -----------------------------
+# --- tokens never leak (security property) -----------------------------
 
 
 def test_a_token_never_appears_in_the_audit_log_or_an_error(
@@ -346,12 +327,9 @@ def test_a_token_never_appears_in_the_audit_log_or_an_error(
 def test_the_token_source_is_read_once_at_boot_over_http(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ) -> None:
-    """The session verifier and the per-call resolver share ONE token table.
-
-    Building them independently read the source twice at boot: two Secrets
-    Manager calls in the deployed task, and a rotation landing between them
-    would leave the session layer and the per-call layer holding different
-    tables. Counting loads pins that there is exactly one.
+    """The session verifier and the per-call resolver share one token table.
+    Building them independently read the source twice, so a rotation between the
+    reads could leave them inconsistent. Counting loads pins that there is one.
     """
     import gate.identity as identity_module
 
@@ -376,14 +354,9 @@ def test_the_token_source_is_read_once_at_boot_over_http(
 def test_the_per_call_check_blocks_even_if_the_session_layer_never_ran(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ) -> None:
-    """Defence in depth: `on_call_tool` authenticates on its own.
-
-    The in-memory transport reaches the gate's middleware WITHOUT passing
-    through the HTTP app, so fastmcp's session-level verifier never runs and no
-    Authorization header exists. That is exactly the case the second layer is
-    for -- the outer check missing, misconfigured, or bypassed. Once session
-    auth landed, every HTTP test was rejected before the middleware, so without
-    this test the per-call check could wave calls through unnoticed.
+    """Defence in depth: on_call_tool authenticates on its own.
+    The in-memory transport reaches the middleware without the HTTP app, so the
+    session verifier never runs. Without this test it could wave such calls through.
     """
     monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
     db_path = tmp_path / "depth.db"

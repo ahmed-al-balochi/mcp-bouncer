@@ -26,16 +26,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"bouncer: {error}")
         return 2
 
-    # Through the factory, not a concrete class: the operator approving a parked
-    # call from a laptop has to reach whichever store the deployed gate is using
-    # (R32). With BOUNCER_STORE=dynamodb this CLI acts on the same table the
-    # running service does.
-    #
-    # Only construction sits inside the try. A misconfigured backend is an
-    # operator error and gets a one-line message; a failure while actually doing
-    # the work is not the same thing and must not be disguised as one. `log`
-    # needs only the audit store, so it does not demand the approvals
-    # configuration it will never touch.
+    # Build through the factory so the operator acts on whichever store the
+    # deployed gate uses. Only construction sits inside the try: a bad
+    # backend is a one-line operator error, but a failure doing the work is not.
     try:
         if arguments.command == "log":
             audit = build_audit_log(db_path=arguments.db)
@@ -105,12 +98,9 @@ def _approve(approvals: ApprovalStore, approval_id: str, ttl_minutes: int) -> in
     if granted is None:
         print(f"bouncer: no parked call with id {approval_id}")
         return 1
-    # Print the grant's REAL lifetime, taken from the approval the store just
-    # wrote, not the baseline the CLI was constructed with. The gate stamped the
-    # caller's effective (possibly team-tightened) TTL on the parked call, so a
-    # CustomerChat grant reads 5 minutes here even though this CLI never knew the
-    # caller's team (R26, bug D5.2). A row without a stamped TTL falls back to
-    # the store default, which is exactly the baseline `ttl_minutes` argument.
+    # Print the grant's real lifetime from the row the store just wrote, not the
+    # CLI's baseline: the gate stamped the caller's effective TTL at park time.
+    # A row with no stamped TTL falls back to the store default.
     lifetime_minutes = (
         granted.ttl_seconds / 60.0 if granted.ttl_seconds is not None else ttl_minutes
     )
@@ -125,9 +115,8 @@ def _approve(approvals: ApprovalStore, approval_id: str, ttl_minutes: int) -> in
 def _format_minutes(minutes: float) -> str:
     """Render a minute count without a trailing `.0` for whole values.
 
-    Grant lifetimes are whole minutes in practice (policy states them in
-    minutes), so `5` reads better than `5.0`; a fractional value still prints
-    honestly rather than being rounded away.
+    Lifetimes are whole minutes in practice, so `5` reads better than `5.0`; a
+    fractional value still prints honestly.
     """
     return str(int(minutes)) if float(minutes).is_integer() else f"{minutes:g}"
 

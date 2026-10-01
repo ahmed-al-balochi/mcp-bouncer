@@ -37,14 +37,9 @@ def db_path(tmp_path: Path) -> Path:
     return tmp_path / "gate.db"
 
 
-# --- backend parametrisation ---------------------------------------------
-#
-# Every behavioural store test runs once per backend. SQLite is the default the
-# gate ships with (R30); the DynamoDB backend has to prove it satisfies the
-# identical contract, not a lookalike (R26, A8), so the same assertions run
-# against it through a moto fake. moto keeps the DynamoDB path entirely
-# in-process: no AWS credentials, no network (R45). The dummy credentials below
-# exist only so boto3 will construct a client at all -- moto never checks them.
+# Every store test runs once per backend so the DynamoDB backend proves it
+# satisfies the same contract as SQLite. moto fakes DynamoDB in-process, so the
+# dummy credentials below exist only so boto3 will build a client.
 
 
 @pytest.fixture(params=["sqlite", "dynamodb"])
@@ -54,25 +49,9 @@ def store_backend(request: pytest.FixtureRequest) -> str:
 
 @pytest.fixture(autouse=True)
 def _moto_writes_are_atomic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give moto's fake the per-write atomicity real DynamoDB has.
-
-    DynamoDB evaluates a write's ConditionExpression and applies the write as one
-    atomic step. moto does not: its ``delete_item`` reads the item, evaluates the
-    condition, then deletes, with nothing held in between, so two threads can
-    both pass the condition and both "win". That made the concurrent one-shot
-    test flaky -- a fault in the fake, not in the store, and proven by widening
-    the gap inside moto, which turned one winner into six.
-
-    Serialising moto's write operations restores the property the store relies
-    on without weakening the test: a store that claimed a grant by reading and
-    then deleting unconditionally would still produce several winners, because
-    the lock covers each single call, not the gap between two of them. The lock
-    is re-entrant because a transaction applies its items through the same
-    backend methods.
-
-    Autouse, because several test modules build their own moto fixture and
-    every one of them needs the same property; patching the class is inert
-    for tests that never start moto.
+    """Serialise moto's writes so its fake has real DynamoDB's per-write atomicity.
+    Without it the concurrent one-shot test is flaky: moto reads, checks, then
+    deletes with nothing held, so two threads both win. The lock is re-entrant.
     """
     from moto.dynamodb.models import DynamoDBBackend
 
@@ -90,15 +69,8 @@ def _moto_writes_are_atomic(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def _dynamodb_client(store_backend: str) -> Iterator[Any]:
     """Yield a moto-faked DynamoDB client, or nothing for the SQLite backend.
-
-    The fake is torn down with the test, so no state leaks between parametrised
-    runs. Table names are unique per test for the same reason.
-
-    The region is pinned for the duration of the test so the provisioning client
-    here and the store's own boto3 client agree: any AWS_REGION inherited from
-    the surrounding shell is overridden, then restored, so a table created in one
-    region is never queried in another. moto ignores credentials, but boto3
-    still needs a region to build a client.
+    The region is pinned for the test so the provisioning client and the store's
+    client agree, overriding any inherited AWS_REGION and restoring it after.
     """
     if store_backend != "dynamodb":
         yield None
@@ -143,11 +115,8 @@ def make_approvals(
     _dynamodb_client: Any,
 ) -> ApprovalStoreFactory:
     """Return a builder for an approval store on the backend under test.
-
-    A builder rather than a fixed instance so a test that needs an injected
-    clock can ask for one and still run against both backends: the point of the
-    parametrisation is that the DynamoDB store honours the identical contract,
-    including the testable-clock seam.
+    A builder, not a fixed instance, so a test needing an injected clock can ask
+    for one and still run against both backends.
     """
     ttl_minutes = registry.limits.approval_ttl_minutes
 

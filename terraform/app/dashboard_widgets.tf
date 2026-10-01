@@ -1,23 +1,20 @@
-# The dashboard's widget rows, assembled as locals so dashboard.tf's body stays
-# readable and each row is documented where it is built. Every metric array uses
-# Terraform references for names/dimensions (R2, R3, R39); metrics that may never
-# fire on a healthy stack are wrapped in FILL(m, 0) so the row shows 0, not "no
-# data" (A17). Region on every widget is local.dashboard_region (the provider
-# 6.x data.aws_region.current.region attribute), never a literal.
-#
-# Grid: CloudWatch lays widgets on a 24-column grid. Each row here sets y so the
-# rows stack top to bottom; widths sum to <= 24 per row.
+# The dashboard's widget rows. Names and dimensions are Terraform references,
+# never literals, and metrics that may never fire are wrapped in FILL(m, 0) so a
+# quiet row shows 0 instead of "no data".
+
+# Grid: CloudWatch lays widgets on a 24-column grid. Each row sets y so rows
+# stack top to bottom; widths sum to <= 24 per row.
 
 locals {
   _r = local.dashboard_region
 
   # ======================================================================
-  # ROW A -- Platform health (R58a)
+  # ROW A: Platform health
+  # ======================================================================
+
   # Both ECS services (CPU/memory/LiveTaskCount), the ALB healthy host count for
   # the LiteLLM target group, the Service Connect gate hop, and both DynamoDB
-  # tables. LiveTaskCount, healthy-host and the 5xx series can read "no data" on
-  # a quiet/healthy stack, so each is FILLed to 0.
-  # ======================================================================
+  # tables. The sparse series read "no data" on a quiet stack, so each is FILLed.
   row_platform_health = [
     {
       type   = "text"
@@ -65,8 +62,8 @@ locals {
         ]
       }
     },
-    # LiveTaskCount: FILLed because a stopped/scaled-to-zero service reports no
-    # data rather than 0, and A17 wants a number.
+    # LiveTaskCount: FILLed because a stopped or scaled-to-zero service reports
+    # no data rather than 0.
     {
       type   = "metric"
       x      = 16
@@ -104,30 +101,12 @@ locals {
       }
     },
     # Service Connect gate hop: requests, p95 response time, and 2xx/4xx/5xx.
-    #
-    # DIMENSIONS -- verified against the AWS/ECS metric table
-    # (https://docs.aws.amazon.com/AmazonECS/latest/developerguide/available-metrics.html),
-    # NOT guessed. Service Connect publishes two distinct dimension families:
-    #   - INBOUND (server-side) metrics -- RequestCount, ActiveConnectionCount,
-    #     NewConnectionCount -- on `DiscoveryName` OR
-    #     `DiscoveryName, ServiceName, ClusterName`, where ServiceName is the
-    #     SERVER service. The gate is the server, so (DiscoveryName=gate,
-    #     ServiceName=gate, ClusterName) is a published set -> RequestCount below.
-    #   - TARGET-attributed metrics -- HTTPCode_Target_2XX/4XX/5XX_Count,
-    #     TargetResponseTime, RequestCountPerTarget -- on `TargetDiscoveryName`
-    #     OR `TargetDiscoveryName, ServiceName, ClusterName`, where ServiceName
-    #     is the CALLING (client) service, i.e. litellm, NOT the gate.
-    # The earlier (ClusterName, ServiceName=gate, TargetDiscoveryName) set the
-    # target metrics used is NOT a documented set (it pairs a target metric with
-    # the server's ServiceName), so it would match no metric and render "no
-    # data" -- and FILL() cannot rescue a series that matches nothing (A17). We
-    # therefore query the target metrics on `TargetDiscoveryName` ALONE (the
-    # single-dimension published set): it aggregates target responses across all
-    # callers of the `gate` discovery name, which is exactly the gate hop, and
-    # does not depend on which client ServiceName CloudWatch stamps for a
-    # client-only Service Connect config (gateway.tf: litellm is client-only).
-    # The discovery-name value is `gate`, derived from the port_name, not typed.
-    # 4xx/5xx are FILLed (may never fire).
+    # Inbound RequestCount uses DiscoveryName+ServiceName (server); target
+    # metrics (HTTPCode_Target_*, TargetResponseTime) use TargetDiscoveryName.
+
+    # Pairing a target metric with the server's ServiceName is not a published
+    # set and renders "no data", which FILL cannot rescue. So target metrics use
+    # TargetDiscoveryName alone, aggregating responses across callers of `gate`.
     {
       type   = "metric"
       x      = 8
@@ -164,12 +143,9 @@ locals {
         ]
       }
     },
-    # DynamoDB, both tables. SystemErrors is published only on
-    # (TableName, Operation) -- never TableName alone -- so it names an operation
-    # the store issues (iam.tf least-privilege). SystemErrors and
-    # ThrottledRequests may never fire, so FILLed. (A latency widget was dropped
-    # at the owner's request: it added noise, not a decision.)
-    # https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/metrics-dimensions.html
+    # DynamoDB, both tables. SystemErrors is published only on (TableName,
+    # Operation), never TableName alone, so it names an operation the store
+    # issues. SystemErrors and ThrottledRequests may never fire, so FILLed.
     {
       type   = "metric"
       x      = 0
@@ -197,11 +173,8 @@ locals {
     },
   ]
 
-  # ======================================================================
-  # ROW B -- Gateway traffic (R58b)
-  # ALB RequestCount, TargetResponseTime p50/p95, and the 4xx/5xx split into
-  # ELB-generated vs target-generated. All error series FILLed to 0.
-  # ======================================================================
+  # ROW B: Gateway traffic. Requests, response time, and 4xx/5xx split by
+  # whether the ALB or LiteLLM produced them.
   row_gateway_traffic = [
     {
       type   = "text"
@@ -269,13 +242,8 @@ locals {
     },
   ]
 
-  # ======================================================================
-  # ROW C -- Model (R58c). Bedrock, platform-wide (R60): ModelId dimension is the
-  # inference profile id (= var.bedrock_inference_profile_id). Invocations,
-  # InvocationLatency p95, input/output tokens, output:input ratio, and errors
-  # split client/server/throttles. Server errors and throttles have never fired,
-  # so FILLed.
-  # ======================================================================
+  # ROW C: Model, platform-wide. Bedrock keys these metrics on the inference
+  # profile id, and a model call carries no team, so nothing here is per team.
   row_model = [
     {
       type   = "text"
@@ -347,13 +315,9 @@ locals {
     },
   ]
 
-  # ======================================================================
-  # ROW D -- Governance, per team (R58d, R60). Built from the metric filters
-  # above (namespace ${project}/gate), dimensioned by team only. Every per-team
-  # series is FILLed to 0 so a team that sent no traffic still shows a 0 line and
-  # the row separates the teams (A17). Content is never surfaced (R33/R60): these
-  # are counts keyed on bounded fields, no caller/tool/args_hash.
-  # ======================================================================
+  # ROW D: Governance per team, from the gate's decision-log metric filters.
+  # Counts keyed on team only, never caller, tool or argument hash, and FILLed
+  # so a team with no traffic still shows a 0 line.
   row_governance = [
     {
       type   = "text"
@@ -365,13 +329,9 @@ locals {
         markdown = "## Governance per team"
       }
     },
-    # Decisions by classification, per team. Each visible series is a FILLed math
-    # expression over a hidden source metric (the Decision_<class> filter,
-    # dimensioned by team); the hidden sources are appended so every math id
-    # resolves. Built with single-level setproduct comprehensions so each metric
-    # ARRAY stays one element -- flatten() would recurse into the arrays and
-    # dissolve them. Teams come from distinct(values(var.callers)), bounded by
-    # policy.
+    # Each visible series is FILL() over a hidden per-team source metric. Built
+    # with setproduct rather than flatten(), which would dissolve the metric
+    # arrays into their elements.
     {
       type   = "metric"
       x      = 0
@@ -466,11 +426,9 @@ locals {
             ["${var.project_name}/gate", "FailClosedByTeam", "team", local.dashboard_teams[ti], { id = "mfc_${ti}", stat = "Sum", visible = false }]
           ],
           [
-            # unattributed = total FailClosed - sum(per-team). Guarded to >= 0 so
-            # a transient ordering never draws a negative. The total is the
-            # existing undimensioned FailClosed metric (monitoring.tf), so a
-            # null-team block still shows up here even though the per-team filter
-            # cannot attribute it.
+            # Unattributed = total FailClosed minus the per-team sum, floored at 0.
+            # A block with no team never reaches the per-team metric, so this is
+            # the only place it shows up.
             [{ expression = "IF((FILL(mfct,0) - (${join(" + ", [for ti, _team in local.dashboard_teams : "FILL(mfc_${ti},0)"])})) > 0, FILL(mfct,0) - (${join(" + ", [for ti, _team in local.dashboard_teams : "FILL(mfc_${ti},0)"])}), 0)", label = "unattributed fail-closed", id = "efcu" }],
             ["${var.project_name}/gate", "FailClosed", { id = "mfct", stat = "Sum", visible = false }],
           ],

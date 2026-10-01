@@ -23,10 +23,9 @@ def test_entries_are_returned_oldest_first_with_every_field(audit: AuditLog):
 
 
 def test_the_log_exposes_no_way_to_change_or_remove_an_entry(audit: AuditLog):
-    # Append-only is structural on every backend: whichever concrete class is
-    # under test must expose record and entries and nothing that rewrites or
-    # removes history. (For DynamoDB this is backed by IAM in the deployed
-    # system too, R29, but the class must not even offer the method.)
+    # Append-only is structural: the class must expose record and entries and
+    # nothing that rewrites or removes history. DynamoDB also backs this with IAM,
+    # but the class must not even offer the method.
     mutators = {"update", "delete", "clear", "truncate", "remove"}
     assert mutators.isdisjoint(dir(type(audit)))
     assert audit.entries() == []

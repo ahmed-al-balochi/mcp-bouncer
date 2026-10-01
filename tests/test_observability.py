@@ -1,14 +1,6 @@
-"""Structured logging: what it records, and what it must never record (R33).
-
-The redaction tests are the ones most likely to be written weakly, so they are
-deliberately concrete: a sentinel argument value and a sentinel token value are
-pushed through real decision and rejection paths, and the captured log stream is
-searched for either. If argument content or a token ever reached the log, one of
-these strings would appear.
-
-Capture is by attaching a handler to the real `bouncer` logger tree and reading
-what the formatter actually emitted -- not by trusting that the emit helpers were
-called with the right fields. No AWS, no external network (R45).
+"""Structured logging: what it records, and what it must never record.
+Sentinel argument and token values are pushed through real decision and rejection
+paths, and the captured log is searched for either. No AWS, no external network.
 """
 
 from __future__ import annotations
@@ -41,10 +33,8 @@ SENTINEL_TOKEN = "tok-SENTINEL-TOKEN-VALUE-qqqqqqqq"
 @pytest.fixture
 def captured_logs() -> Iterator[io.StringIO]:
     """Route the bouncer logger through the JSON formatter into a buffer.
-
-    Uses the module's own `configure_logging` so the formatter under test is the
-    one exercised, then restores the logger's handlers afterwards so one test's
-    capture does not bleed into another.
+    Uses the module's own configure_logging so the formatter under test runs,
+    then restores the logger's handlers afterwards.
     """
     buffer = io.StringIO()
     logger = logging.getLogger(observability.ROOT_LOGGER_NAME)
@@ -142,13 +132,8 @@ def test_an_authentication_rejection_logs_no_token(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ):
     """Push a real bad token across a real socket and prove it is not in the log.
-
-    Under the amended R18 the bad token is rejected at the session layer (before
-    the MCP session manager), so the client raises rather than getting an error
-    ToolResult. The rejection is logged -- by the shared resolver's own warning,
-    which records the SHAPE of the failure ("unrecognised bearer token") and
-    never the credential. The capture must be installed in this process before
-    the request and read after.
+    The token is rejected at the session layer, so the client raises.
+    The rejection is logged by shape ("unrecognised bearer token"), not the token.
     """
     monkeypatch.setenv(
         LOCAL_TOKENS_ENV,
@@ -231,7 +216,7 @@ def test_a_logging_failure_does_not_change_an_allowed_calls_outcome(
 ):
     """Break the log emit, then confirm an allowed call still succeeds and a
     parked call still parks. A logging fault must not turn a pass into an error,
-    nor -- the dangerous direction -- a block into a pass."""
+    nor, in the dangerous direction, a block into a pass."""
 
     def explode(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("logging subsystem is down")
@@ -251,7 +236,7 @@ def test_a_logging_failure_does_not_change_an_allowed_calls_outcome(
     assert parked.is_error is True, "a logging failure turned a blocked call into a pass"
 
 
-# --- fail-closed lines are attributable to a team (R59) -------------------
+# --- fail-closed lines are attributable to a team -------------------
 
 
 def _fail_closed_lines(buffer: io.StringIO) -> list[dict[str, Any]]:
@@ -264,11 +249,9 @@ def test_a_fail_closed_block_names_the_callers_team(
     policy_path: Path,
     db_path: Path,
 ):
-    """The per-team fail-closed rate (R59) groups these lines by `team`.
-
-    The failure is injected AFTER the caller is identified, so the team is known
-    and must be on the line. A fail-closed block writes no decision line, which
-    is why the rate's denominator has to count both events.
+    """A fail-closed block is grouped by team, so the team must be on the line.
+    The failure is injected after the caller is identified. A fail-closed block
+    writes no decision line, so the rate's denominator counts both events.
     """
     from gate import policy
 

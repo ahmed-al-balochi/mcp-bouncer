@@ -6,7 +6,7 @@ aws_region = "eu-west-1"
 
 # The delegated zone from the bootstrap stack. The gateway is served at
 # <gateway_host_label>.<this zone> (default llm.<zone>); the apex serves nothing.
-# Supply your own; nothing here is hardcoded (R3).
+# Supply your own; nothing here is hardcoded.
 dns_zone_name = "bouncer.example.com"
 
 # Receives the fail_closed alarm. AWS emails a confirmation link you must click.

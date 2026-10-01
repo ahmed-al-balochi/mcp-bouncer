@@ -1,11 +1,6 @@
 """Unit tests for the identity seam: token sources, validation, and rejection.
-
-These exercise gate.identity in isolation -- the resolvers and the boot-time
-token loading -- without a running server. The end-to-end HTTP path is proven
-separately in tests/test_identity_lifecycle.py, through the real proxy.
-
-No test here needs AWS or the network: the local sources are pure, and the
-Secrets Manager source is faked with moto (R45).
+They exercise gate.identity in isolation; the HTTP path is in
+test_identity_lifecycle.py. The Secrets Manager source is faked with moto.
 """
 
 from __future__ import annotations
@@ -83,11 +78,11 @@ def test_stdio_with_an_explicit_unknown_team_refuses_to_boot():
     assert "Ghost" in str(error.value)
 
 
-# --- HTTP transport: rejection paths (A6) ---------------------------------
+# --- HTTP transport: rejection paths ---------------------------------
 
 
 def test_http_with_no_token_source_refuses_to_boot():
-    """R13: HTTP with nothing configured must fail closed at boot, not pass all."""
+    """HTTP with nothing configured must fail closed at boot, not pass all."""
     with pytest.raises(IdentityConfigError):
         build_identity_resolver(transport="http", caller="ignored", known_teams=TEAMS)
 
@@ -136,7 +131,7 @@ def test_a_missing_or_malformed_header_is_rejected(
 def test_every_rejection_gives_the_same_uninformative_message(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """R18 anti-enumeration: unknown token and malformed header look identical."""
+    """Anti-enumeration: unknown token and malformed header look identical."""
     monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TABLE))
     resolver = build_identity_resolver(
         transport="http", caller="ignored", known_teams=TEAMS
@@ -175,7 +170,7 @@ def test_the_header_name_is_matched_case_insensitively(
     assert resolver.resolve({"Authorization": f"bearer {TOKEN}"}).caller == "customer-agent"
 
 
-# --- two tokens, two callers (A6) -----------------------------------------
+# --- two tokens, two callers -----------------------------------------
 
 
 def test_two_tokens_map_to_two_distinct_callers(monkeypatch: pytest.MonkeyPatch):
@@ -227,7 +222,7 @@ def test_the_file_is_layered_over_the_env_var(
     assert resolver.resolve(_bearer(TOKEN)).caller == "customer-agent"
 
 
-# --- boot failures: a bad source refuses to start (R17) -------------------
+# --- boot failures: a bad source refuses to start -------------------
 
 
 def test_malformed_json_refuses_to_boot(monkeypatch: pytest.MonkeyPatch):
@@ -274,12 +269,12 @@ def test_an_unknown_identity_source_refuses_to_boot(monkeypatch: pytest.MonkeyPa
         build_identity_resolver(transport="http", caller="ignored", known_teams=TEAMS)
 
 
-# --- Secrets Manager source, faked with moto (R45) ------------------------
+# --- Secrets Manager source, faked with moto ------------------------
 
 
 @pytest.fixture
 def _secretsmanager(monkeypatch: pytest.MonkeyPatch) -> Iterator[object]:
-    """A moto-faked Secrets Manager client, entirely in-process (R45)."""
+    """A moto-faked Secrets Manager client, entirely in-process."""
     region = "us-east-1"
     saved = {
         name: os.environ.get(name)
@@ -355,10 +350,8 @@ def test_secretsmanager_source_with_malformed_json_refuses_to_boot(
 
 def test_resolver_does_not_use_plain_equality_for_tokens():
     """The comparison must be hmac.compare_digest, never ==.
-
-    Asserted structurally: the source of the match method must call
-    compare_digest and must not compare the incoming token with ==. A timing
-    leak is invisible to a behavioural test, so this reads the implementation.
+    A timing leak is invisible to a behavioural test, so this reads the match
+    method's source and asserts it calls compare_digest and never compares with ==.
     """
     import ast
     import inspect

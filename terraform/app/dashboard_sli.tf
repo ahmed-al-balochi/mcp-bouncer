@@ -1,14 +1,10 @@
-# The SLI row (R59) and the absent-indicators text widget (R60, R61). Kept in
-# their own file so the SLI math and the target annotations read next to each
-# other. Every SLI with a target draws that target as a horizontal annotation
-# whose value comes from local.sli_targets (one source, R59), and where
-# CloudWatch can express attainment over the viewed range a singleValue widget
-# shows it. The two indicators without a hard target (token ratio) carry a label
-# saying why, not a line.
+# The SLI row and the absent-indicators text widget. Every SLI with a target
+# draws it as a horizontal annotation whose value comes from local.sli_targets;
+# the token ratio has no hard target and carries a label saying why.
 
 locals {
   # ======================================================================
-  # ROW E -- Service level indicators (R59)
+  # ROW E: Service level indicators
   # ======================================================================
   row_sli = [
     {
@@ -74,10 +70,10 @@ locals {
     },
 
     # --- Error rate split by class -------------------------------------------
-    # ELB 4xx, ELB 5xx, target 4xx, target 5xx, Bedrock client/server/throttle,
-    # each as a % of the relevant request count, with the <1% target annotation.
-    # ALB classes are over ALB RequestCount; Bedrock classes over Bedrock
-    # Invocations. All FILLed so a healthy stack reads 0%.
+
+    # ELB 4xx/5xx, target 4xx/5xx, Bedrock client/server/throttle, each as a % of
+    # the relevant request count with the target annotation. ALB classes over ALB
+    # RequestCount, Bedrock over Invocations. All FILLed so a healthy stack reads 0%.
     {
       type   = "metric"
       x      = 0
@@ -138,7 +134,7 @@ locals {
       }
     },
 
-    # --- Output:input token ratio -- NO target (R59) -------------------------
+    # --- Output:input token ratio, no target ---------------------------------
     # Shown without a target line; the label states a normal band needs history
     # this demo does not have.
     {
@@ -159,9 +155,8 @@ locals {
       }
     },
 
-    # --- Gate fail-closed rate per team = fc / (decisions + fc) --------------
-    # per team, plus unattributed, target 0%. Denominator is decision lines +
-    # fail_closed lines for that team (a fail-closed writes no decision line).
+    # Fail-closed rate per team = fc / (decisions + fc), target 0%. A fail-closed
+    # block writes no decision line, so both counts go in the denominator.
     # All inputs FILLed so a quiet/healthy team reads 0%.
     {
       type   = "metric"
@@ -203,7 +198,7 @@ locals {
   ]
 
   # ======================================================================
-  # ROW F -- Absent indicators text (R60, R61)
+  # ROW F: Absent indicators text
   # ======================================================================
   row_absences_text = [
     {

@@ -1,13 +1,6 @@
 # The two DynamoDB tables the gate uses. Their shape is authoritative in
-# tests/dynamodb_tables.py -- the store code was written against exactly this key
-# design -- so these definitions mirror it attribute for attribute. A drift here
-# would surface as the store failing to Query at runtime.
-#
-# PAY_PER_REQUEST so there is no provisioned capacity to size or pay for while
-# idle; a POC's traffic is bursty and low. deletion_protection is OFF: this is
-# the disposable stack and `terraform destroy` must leave nothing running or
-# billable (R41). Encryption at rest is on by default with the AWS-owned key, so
-# no explicit block is needed.
+# tests/dynamodb_tables.py, so these mirror it attribute for attribute; a drift
+# here surfaces as the store failing to Query. PAY_PER_REQUEST, no deletion lock.
 
 # --- approvals table -------------------------------------------------------
 
@@ -63,17 +56,15 @@ resource "aws_dynamodb_table" "approvals" {
 
   # Native TTL on the `ttl` attribute: DynamoDB removes stale grants eventually,
   # while the store's claim condition still refuses a stale grant it reads first
-  # (R28, twice-enforced expiry). This is the table setting the tests mirror.
+  # (twice-enforced expiry). This is the table setting the tests mirror.
   ttl {
     attribute_name = "ttl"
     enabled        = true
   }
 
-  # Point-in-time recovery: enabled. It adds continuous backups but does NOT
-  # block destroy -- PITR backups are dropped with the table, so R41 still holds
-  # -- and it is nearly free at POC volume. The safety of a recover-from-oops
-  # window is worth more than the negligible cost. Justified per the task's
-  # "optional, your call" note.
+  # Point-in-time recovery: enabled. It adds continuous backups but does not
+  # block destroy (PITR backups drop with the table), and it is nearly free at
+  # POC volume, so the recover-from-oops window is worth the negligible cost.
   point_in_time_recovery {
     enabled = true
   }

@@ -1,39 +1,7 @@
-"""The identity seam: who is calling, and how we know it (R18-R21).
+"""The single place that understands authentication.
 
-This module is the single place that understands authentication. Everything
-downstream -- middleware, policy, registry -- receives an already-resolved
-`Identity` and never learns how it was established. Replacing bearer tokens with
-mTLS or SigV4 later is an edit to this file and nothing else (R21).
-
-Two transports, two honest answers to "who is this":
-
-* Over **stdio** the client spawned this very process, so the operating system
-  already bound the caller to us: there is no network in between and no header
-  to forge. The spawning identity IS the identity, and it arrives as the
-  `--caller` argument. Trusting it is not a weakness, it is the transport's own
-  guarantee (R18).
-
-* Over **HTTP** the gate is reachable across a network boundary, so nothing
-  about the connection proves who is on the other end. Identity MUST be
-  authenticated from an `Authorization: Bearer <token>` header, and there is no
-  `--caller` fallback: a missing token, an unparsable header, or an unknown
-  token is rejected before classification ever runs (R18). If HTTP is selected
-  with no token source configured at all, every call is rejected -- the gate
-  fails closed rather than waving traffic through (R13).
-
-Security properties enforced here, and nowhere else:
-
-* Tokens are compared with `hmac.compare_digest`, never `==`, so a comparison
-  cannot leak a token's contents through timing.
-* A token never reaches a log line, an error returned to a caller, or a
-  traceback. `AuthenticationError` carries only an uninformative caller-facing
-  message; server-side detail is logged separately and without the credential.
-* Rejections do not distinguish "unknown token" from "malformed header" to the
-  caller, so the gate cannot be used as an oracle to enumerate valid tokens.
-* A token source that cannot load -- unreachable secret, malformed JSON, or a
-  token mapped to a team that policy.yaml does not define -- makes the gate
-  refuse to boot, exactly as the registry refuses a bad policy (R17). The gate
-  never starts in a degraded, half-authenticated state.
+Downstream code receives a resolved Identity and never learns how it was
+established, so swapping the auth mechanism later touches only this file.
 """
 
 from __future__ import annotations
@@ -49,28 +17,27 @@ from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 
 logger = logging.getLogger("bouncer.identity")
 
-# Selection knob, BOUNCER_-prefixed to match BOUNCER_STORE / BOUNCER_DB /
-# BOUNCER_POLICY. The default is the local source so offline development and the
-# test suite need no AWS and no network (R20).
+# Selection knob, BOUNCER_-prefixed to match the other BOUNCER_ settings. The
+# default is the local source so offline development and tests need no AWS and
+# no network.
 IDENTITY_ENV = "BOUNCER_IDENTITY"
 
 # Local source inputs. Either or both may be set; the file is merged over the
-# environment variable, and both are optional so a pure-env or pure-file
-# deployment works.
+# environment variable, and both are optional.
 LOCAL_TOKENS_ENV = "BOUNCER_TOKENS"
 LOCAL_TOKENS_FILE_ENV = "BOUNCER_TOKENS_FILE"
 
-# Secrets Manager source input: the secret's name or ARN. boto3 resolves it at
-# boot. The container gets this by environment variable (R19).
+# Secrets Manager source input: the secret's name or ARN, resolved by boto3 at
+# boot.
 SECRET_ID_ENV = "BOUNCER_TOKENS_SECRET"
 
 SOURCE_LOCAL = "local"
 SOURCE_SECRETS_MANAGER = "secretsmanager"
 DEFAULT_SOURCE = SOURCE_LOCAL
 
-# One caller-facing message for every authentication failure. Deliberately
-# uninformative: it must not help an attacker tell a bad token from a malformed
-# header from an unknown token.
+# One caller-facing message for every authentication failure, deliberately
+# uninformative so it cannot help tell a bad token from a malformed header from
+# an unknown token.
 _REJECTED_MESSAGE = "authentication failed: a valid bearer token is required"
 
 _BEARER_PREFIX = "bearer "
@@ -79,7 +46,7 @@ _BEARER_PREFIX = "bearer "
 class IdentityConfigError(RuntimeError):
     """A token source is unreachable, malformed, or maps a token to no team.
 
-    Raised at boot only. Like `PolicyConfigError`, it means the gate must not
+    Raised at boot only. Like PolicyConfigError, it means the gate must not
     start: there is no safe half-configured identity state.
     """
 
@@ -87,9 +54,8 @@ class IdentityConfigError(RuntimeError):
 class AuthenticationError(Exception):
     """A call could not be authenticated. Its message is safe to return.
 
-    The message is intentionally the same for every failure mode so it cannot be
-    used to enumerate valid tokens. Any distinguishing detail belongs in a
-    server-side log, never in this exception.
+    The message is the same for every failure mode so it cannot be used to
+    enumerate valid tokens; distinguishing detail belongs in a server-side log.
     """
 
     def __init__(self, message: str = _REJECTED_MESSAGE) -> None:
@@ -100,15 +66,13 @@ class AuthenticationError(Exception):
 class Identity:
     """The authenticated caller and the team it belongs to.
 
-    Caller and team are distinct on purpose: the destructive rate cap is per
-    caller, while policy overrides are per team, and several callers may share
-    one team even though the POC ships one caller per team. Collapsing them
-    would make it impossible to model that later without a schema change.
+    Caller and team are kept distinct because the rate cap is per caller while
+    policy overrides are per team, and several callers may share one team.
     """
 
     caller: str
-    # None means "no team override": the baseline applies. Only the stdio path
-    # with no --team produces this; every bearer token maps to a named team.
+    # None means no team override, so the baseline applies. Only the stdio path
+    # with no --team produces this.
     team: str | None
 
 
@@ -121,23 +85,20 @@ class _TokenRecord:
 
 
 class IdentityResolver(Protocol):
-    """Turn the transport-level request context into an `Identity`.
+    """Turn the transport-level request context into an Identity.
 
     `headers` is the request's HTTP headers (empty over stdio). Implementations
-    either return an `Identity` or raise `AuthenticationError`; they never return
-    an anonymous fallback on the HTTP path.
+    return an Identity or raise AuthenticationError, never an anonymous fallback.
     """
 
     def resolve(self, headers: Mapping[str, str]) -> Identity: ...
 
 
 class StdioIdentityResolver:
-    """Trust the spawning process's declared identity (stdio transport only).
+    """Trust the spawning process's declared identity (stdio only).
 
-    There is no token here because there is no network here: the client started
-    this process, so the OS boundary already authenticated the caller. The team
-    is supplied alongside the caller so per-team policy still applies to a local
-    run.
+    There is no token because there is no network: the client started this
+    process, so the OS boundary already authenticated the caller.
     """
 
     def __init__(self, caller: str, team: str | None) -> None:
@@ -149,38 +110,31 @@ class StdioIdentityResolver:
 
 
 class BearerTokenIdentityResolver:
-    """Authenticate every HTTP call from an `Authorization: Bearer <token>` header.
+    """Authenticate every HTTP call from an Authorization: Bearer header.
 
-    The token-to-identity table is resolved once at boot and held in memory; no
-    lookup here touches the network. There is no `--caller` fallback: if the
-    header is absent, unparsable, or names a token we do not hold, the call is
-    rejected before classification (R18).
+    The token table is resolved once at boot and held in memory. There is no
+    --caller fallback; an absent, unparsable, or unknown token is rejected.
     """
 
     def __init__(self, tokens: Mapping[str, _TokenRecord]) -> None:
-        # Copy into a plain dict we own, so a caller cannot mutate the table
-        # after boot. The keys are the raw token strings.
+        # Copy into a dict we own so a caller cannot mutate the table after boot.
+        # Keys are the raw token strings.
         self._tokens: dict[str, _TokenRecord] = dict(tokens)
 
     def resolve(self, headers: Mapping[str, str]) -> Identity:
         token = _extract_bearer(headers)
         if token is None:
-            # No header, or not a Bearer header. Uninformative to the caller;
-            # the server-side log records the shape of the failure, never a
-            # token value.
+            # No header, or not a Bearer header. The log records the shape of
+            # the failure, never a token value.
             logger.warning("authentication rejected: missing or malformed Authorization header")
             raise AuthenticationError()
         return self.authenticate(token)
 
     def authenticate(self, token: str) -> Identity:
-        """Turn a raw bearer token into an `Identity`, or raise.
+        """Turn a raw bearer token into an Identity, or raise.
 
-        Factored out of `resolve()` so the fastmcp session-level verifier
-        (`BouncerTokenVerifier`) authenticates against the SAME token table and
-        the SAME `hmac.compare_digest` matching this resolver uses, rather than
-        keeping a second copy of either (R21). `resolve()` owns header parsing;
-        this owns the token-to-identity decision. Both funnel through `_match`,
-        so there is exactly one comparison and one table in the process.
+        Shared with the fastmcp session verifier so both authenticate against the
+        same table and the same hmac.compare_digest, with no second copy.
         """
         record = self._match(token)
         if record is None:
@@ -192,11 +146,8 @@ class BearerTokenIdentityResolver:
     def _match(self, token: str) -> _TokenRecord | None:
         """Constant-time-per-candidate lookup.
 
-        A plain dict `get(token)` would compare the token with `==` through the
-        hash table and leak length and content through timing. Comparing every
-        stored token with `hmac.compare_digest` keeps the comparison independent
-        of how much of the token matched. The table is small (one entry per
-        caller), so scanning it is cheap.
+        A dict get() compares with == and leaks length and content through
+        timing; comparing every token with hmac.compare_digest does not.
         """
         encoded = token.encode("utf-8")
         matched: _TokenRecord | None = None
@@ -207,11 +158,10 @@ class BearerTokenIdentityResolver:
 
 
 def _extract_bearer(headers: Mapping[str, str]) -> str | None:
-    """Pull the token out of an `Authorization: Bearer <token>` header.
+    """Pull the token out of an Authorization: Bearer header.
 
-    Returns None for any header we cannot parse into a non-empty token, so the
-    caller treats "no header", "wrong scheme", and "empty token" identically.
-    Header names are matched case-insensitively because HTTP header names are.
+    Returns None for anything that is not a non-empty token, so the caller
+    treats "no header", "wrong scheme", and "empty token" identically.
     """
     raw = _header(headers, "authorization")
     if raw is None:
@@ -240,29 +190,15 @@ def build_identity_resolver(
     known_teams: frozenset[str],
     team: str | None = None,
 ) -> IdentityResolver:
-    """Construct the identity resolver, or raise `IdentityConfigError` at boot.
+    """Construct the identity resolver, or raise IdentityConfigError at boot.
 
-    `transport` decides the model, not a runtime sniff:
-
-    * `stdio` (and the in-memory test transport) trusts `--caller`. `team` picks
-      which team's policy applies; it defaults to the caller name so a local run
-      with a matching team block just works, and it must name a team the policy
-      defines.
-    * `http` builds a `BearerTokenIdentityResolver` from the configured token
-      source. If no token source is configured at all, that is a boot failure,
-      not an open door (R13).
-
-    `known_teams` is the set of team names policy.yaml defines. Every identity a
-    resolver can ever produce must map to one of them, checked here at boot, so
-    an unknown-team token can never reach the policy at request time.
+    stdio trusts --caller and validates an explicit --team; http builds a
+    bearer-token resolver and refuses to boot with no token source.
     """
     if transport == "stdio":
-        # Over stdio only an EXPLICIT team is validated against the policy. With
-        # no --team the caller runs on the baseline (team=None), which is the
-        # loosest the gate applies and exactly what the default local run and
-        # the in-memory test transport expect. An explicit team, by contrast, is
-        # a deliberate choice and must name a team the policy defines, so a typo
-        # fails at boot rather than silently falling back to the baseline.
+        # With no --team the caller runs on the baseline (team=None), the
+        # loosest the gate applies. An explicit --team is a deliberate choice and
+        # must name a team the policy defines, so a typo fails at boot.
         if team is not None and team not in known_teams:
             raise IdentityConfigError(
                 f"--team {team!r} is not defined in policy.yaml; known teams: "
@@ -273,13 +209,9 @@ def build_identity_resolver(
     if transport == "http":
         tokens = _load_tokens(known_teams)
         if not tokens:
-            # HTTP with no usable token source is the fail-closed case: rather
-            # than authenticate nobody and pass everybody, refuse to boot.
-            #
-            # The message names the SELECTED source, because the trap here is
-            # setting the secret variable while leaving the selector at its
-            # default: the secret is then never consulted, and an error listing
-            # a variable the operator has already set reads as a lie.
+            # HTTP with no usable token source fails closed: refuse to boot. The
+            # message names the SELECTED source, so it does not point at a
+            # variable the operator set under a different, unselected source.
             source = _selected_source()
             if source == SOURCE_SECRETS_MANAGER:
                 remedy = f"set {SECRET_ID_ENV} to a secret holding the token map"
@@ -305,9 +237,8 @@ def _selected_source() -> str:
 def _load_tokens(known_teams: frozenset[str]) -> Mapping[str, _TokenRecord]:
     """Load and validate the token table from the selected source.
 
-    Every token must map to a team policy.yaml defines; a token pointing at an
-    undefined team is a boot failure (R17), because honouring it at request time
-    would mean applying no team's overrides -- silently loosening the baseline.
+    Every token must map to a team policy.yaml defines; a token for an undefined
+    team is a boot failure, since it would silently loosen the baseline.
     """
     source = _selected_source()
     if source == SOURCE_LOCAL:
@@ -325,10 +256,8 @@ def _load_tokens(known_teams: frozenset[str]) -> Mapping[str, _TokenRecord]:
 def _load_local_tokens() -> Mapping[str, object]:
     """Read the token mapping from an env var and/or a JSON file, both optional.
 
-    The file is layered over the environment variable so a deployment can ship a
-    base set one way and override individual tokens the other; neither being set
-    is not an error here (the HTTP path decides that), it just yields an empty
-    table.
+    The file is layered over the environment variable. Neither being set yields
+    an empty table, which the HTTP path decides whether to treat as an error.
     """
     merged: dict[str, object] = {}
 
@@ -352,15 +281,13 @@ def _load_local_tokens() -> Mapping[str, object]:
 def _load_secretsmanager_tokens() -> Mapping[str, object]:
     """Resolve the token mapping from AWS Secrets Manager at boot.
 
-    boto3 is imported LAZILY, right here, exactly as the DynamoDB store does it,
-    so the local path and the test suite never need boto3 installed (R44). The
-    secret's value is a JSON object of the same shape as the local source. The
-    secret's contents are never logged.
+    boto3 is imported lazily so the local path and tests never need it. The
+    secret is JSON of the same shape as the local source and is never logged.
     """
     secret_id = os.environ.get(SECRET_ID_ENV, "").strip()
     if not secret_id:
-        # No secret configured under this source: an empty table, which the HTTP
-        # path turns into a refuse-to-boot. Kept distinct from a load failure.
+        # No secret under this source: an empty table, which the HTTP path turns
+        # into a refuse-to-boot. Kept distinct from a load failure.
         return {}
 
     try:
@@ -396,9 +323,8 @@ def _validate_tokens(
 ) -> Mapping[str, _TokenRecord]:
     """Turn the raw {token: {caller, team}} mapping into validated records.
 
-    Rejects, as a boot failure: a non-object entry, a missing caller or team, a
-    team the policy does not define. Error messages never include a token value;
-    tokens are identified by their caller/team, which are not secret.
+    Rejects a non-object entry, a missing caller or team, or an undefined team.
+    Error messages identify a token by its caller/team, never by its value.
     """
     validated: dict[str, _TokenRecord] = {}
     for token, entry in raw.items():
@@ -447,56 +373,24 @@ def _read_file(path: str) -> str:
 
 
 class BouncerTokenVerifier(TokenVerifier):
-    """Authenticate the whole MCP session, not just tool calls (R18 amended, A6).
+    """Authenticate the whole MCP session, not just tool calls.
 
-    Why this exists at all: `GateMiddleware.on_call_tool` authenticates every
-    tool call, but a `Middleware` hook only fires for tool calls. Over HTTP the
-    session's `initialize` handshake and its `tools/list` catalogue listing are
-    NOT tool calls, so nothing behind that hook can see them; without a
-    session-level check an unauthenticated client could open a session and read
-    the whole tool catalogue before it ever tried a call it could not make.
-    fastmcp's native auth seam runs BEFORE the MCP session manager -- its
-    `AuthenticationMiddleware`/`RequireAuthMiddleware` gate the streamable-HTTP
-    route itself -- so wiring a verifier there is the only place that covers
-    `initialize` and `tools/list` too. This is the single component that adapts
-    fastmcp's token seam to ours.
-
-    Why it delegates rather than re-implements: the token table and the
-    `hmac.compare_digest` matching already live on `BearerTokenIdentityResolver`
-    and must stay a single seam (R21). Duplicating either here would create a
-    second place a token is compared and a second copy of the table to keep in
-    sync -- exactly the drift R21 forbids. So the verifier holds the SAME
-    resolver `GateMiddleware` holds and calls its `authenticate()`; there is one
-    table and one comparison in the process.
-
-    Why it returns `None` on failure instead of raising: that is fastmcp's
-    contract (`TokenVerifier.verify_token`), and `BearerAuthBackend` turns a
-    `None` into the 401 with a deliberately-uninformative body. Translating our
-    `AuthenticationError` into `None` keeps the oracle-safe property at the HTTP
-    layer too: a wrong token and a malformed header both become the same 401.
-    The token is never logged here; the resolver's own rejection log records the
-    shape of the failure, never the credential.
+    A Middleware hook misses initialize and tools/list, so this gates them via
+    fastmcp's auth seam, delegating to the resolver GateMiddleware holds.
     """
 
     def __init__(self, resolver: BearerTokenIdentityResolver) -> None:
         # No base_url / resource_base_url on purpose: with neither set, fastmcp
-        # registers NO `.well-known/oauth-protected-resource` route and the 401's
-        # WWW-Authenticate advertises no resource-metadata URL, so adding auth
-        # opens no new unauthenticated disclosure surface (verified in
-        # fastmcp/server/http.py: resource_metadata_url is None when
-        # _get_resource_url() returns None).
+        # registers no oauth-protected-resource route and the 401 advertises no
+        # metadata URL, so adding auth opens no new disclosure surface.
         super().__init__()
         self._resolver = resolver
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Verify a session-level bearer token via the shared resolver.
 
-        `scopes=[]` because the gate does not model OAuth scopes: authorisation
-        is the policy engine's job, keyed on the resolved caller/team, not on
-        token scopes. `client_id` carries the authenticated caller so it is
-        available to anything downstream that inspects the fastmcp auth context;
-        the authoritative identity the gate acts on is still re-resolved by
-        `GateMiddleware` from the same header (defence in depth).
+        scopes=[] because the gate authorises in the policy engine, not via token
+        scopes; GateMiddleware still re-resolves the authoritative identity.
         """
         try:
             identity = self._resolver.authenticate(token)

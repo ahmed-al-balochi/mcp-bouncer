@@ -1,23 +1,6 @@
-"""The demo upstream's `wiki.rename_page` is a REAL tool the gate denies as
-`unknown` (D6.19, R8, A2).
-
-The point being proved is the honest R8 case: the upstream advertises a working
-tool that policy.yaml has not classified, so a client (or a model) can see it in
-the catalogue and try to call it, and the gate blocks it before it runs. Each
-test here fails if that property breaks:
-
-- the catalogue a client sees THROUGH the gate includes `wiki.rename_page`, so
-  the tool is genuinely reachable and the denial is not just "no such tool";
-- calling it through the gate is blocked as `unknown`, the audit row records
-  classification `unknown` / decision `block`, AND the page is NOT renamed --
-  proven by reading the original title back through the gate afterwards, so the
-  upstream tool demonstrably never ran;
-- calling the upstream tool directly (no gate) renames the page, so the denial
-  is the gate's doing and not a broken tool.
-
-Every through-the-gate call goes over the MCP protocol via the in-memory
-transport, exactly as `test_lifecycle.py` does, so the gate is exercised as a
-proxy rather than as a function call.
+"""The demo upstream's `wiki.rename_page` is a real tool the gate denies as
+`unknown`. The upstream advertises a working tool policy.yaml has not
+classified, so the gate must block it before it runs, over the in-memory transport.
 """
 
 from __future__ import annotations
@@ -71,7 +54,7 @@ def text_of(result: Any) -> str:
 
 def test_the_gate_catalogue_advertises_rename_page(gate: Any):
     """A client talking to the gate sees rename_page, so it is a real, reachable
-    tool -- the precondition for the honest 'unknown tool denied' case."""
+    tool. That is the precondition for the honest 'unknown tool denied' case."""
     assert "wiki.rename_page" in tool_names(gate)
 
 

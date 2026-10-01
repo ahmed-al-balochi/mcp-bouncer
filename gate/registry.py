@@ -1,17 +1,7 @@
 """Loads policy.yaml, the single source of gate rules, and refuses bad input.
 
-`load_registry` either returns a fully validated registry or raises
-`PolicyConfigError`. Callers do not get a partially applied policy, so the gate
-cannot boot with rules it did not understand.
-
-The registry also owns per-team policy (R22-R25). A `teams:` block may override
-tool classifications and limits, but only to TIGHTEN: the same escalate-only
-principle already applied to untrusted MCP annotations. Every override is
-validated at boot against the baseline, and any loosening -- a softer
-classification, a higher cap, a longer TTL, a tool the baseline does not
-classify, or a change to the deny-by-default defaults -- is a validation failure
-that refuses the boot (R17, R23). The middleware asks the registry for a team's
-effective view; the pure policy engine still does no lookups of its own (R21).
+load_registry returns a fully validated registry or raises PolicyConfigError.
+Team overrides may only tighten; any loosening refuses the boot.
 """
 
 from __future__ import annotations
@@ -32,21 +22,14 @@ POLICY_PATH_ENV = "BOUNCER_POLICY"
 _CLASSES = ("read", "write", "destructive")
 _LITERALS: Mapping[str, Any] = {"true": True, "false": False, "null": None}
 
-# Escalate-only orderings. A team override may move a value UP one of these
-# ladders and never down.
-#
-# Classification severity: a team may promote read -> write -> destructive
-# (guarding more tightly) but never demote. Identical to the annotation
-# escalation floor in policy.py, applied here to a deliberate team decision
-# rather than an untrusted upstream hint.
+# Escalate-only ladder for classification: a team may promote
+# read -> write -> destructive but never demote, the same escalation floor
+# policy.py applies to annotations.
 _CLASS_SEVERITY: Mapping[str, int] = {name: rank for rank, name in enumerate(_CLASSES)}
 
-# Action restrictiveness: pass < approve < block. `pass` lets a call straight
-# through, `approve` parks it for a human, `block` refuses it outright, so each
-# step to the right withholds strictly more. A team may make an action stricter
-# (pass -> approve -> block) but never looser. This is the ordering R23 asks the
-# implementer to reason about and record: it is "how much is withheld", so the
-# tightest action, block, ranks highest.
+# Action restrictiveness: pass < approve < block, since each step withholds
+# strictly more. A team may make an action stricter but never looser; block, the
+# tightest, ranks highest.
 _ACTION_RESTRICTIVENESS: Mapping[str, int] = {"pass": 0, "approve": 1, "block": 2}
 
 
@@ -58,10 +41,8 @@ class PolicyConfigError(RuntimeError):
 class TeamView:
     """A single team's effective, already-tightened rules.
 
-    Precomputed at boot so the request path is a dict lookup, not a merge, and so
-    every loosening is caught before the gate accepts traffic. Shaped exactly
-    like the baseline (patterns + Limits) because that is what the pure policy
-    engine consumes -- the engine cannot tell a team view from the baseline.
+    Precomputed at boot so the request path is a dict lookup and loosening is
+    caught first. Shaped like the baseline so the pure engine cannot tell apart.
     """
 
     patterns: Mapping[str, str]
@@ -80,11 +61,8 @@ class Registry:
     def for_team(self, team: str | None) -> TeamView:
         """Return the effective view for a team, falling back to the baseline.
 
-        A caller whose team has no override block runs on the baseline rules --
-        never on something looser, because the baseline is the loosest the gate
-        ever applies. An unknown team also gets the baseline here; identity
-        validation at boot already guarantees every real caller's team exists,
-        so this fallback only matters for the anonymous/default local case.
+        A team with no override runs on the baseline, the loosest the gate
+        applies. The unknown case only matters for the anonymous local run.
         """
         if team is not None and team in self.teams:
             return self.teams[team]
@@ -135,10 +113,8 @@ def _build_team_views(
 ) -> Mapping[str, TeamView]:
     """Validate every team's overrides against the baseline and freeze the result.
 
-    Each override is checked for loosening BEFORE it is applied; the first
-    loosening raises `PolicyConfigError` so the gate refuses to boot (R23). The
-    checks live here, next to the baseline they compare against, rather than in
-    the pure engine, which must stay lookup-free.
+    Each override is checked for loosening before it is applied; the first
+    loosening refuses the boot. The pure engine stays lookup-free.
     """
     views: dict[str, TeamView] = {}
     for name, override in (document.teams or {}).items():
@@ -158,14 +134,8 @@ def _tightened_patterns(
 ) -> dict[str, str]:
     """Merge a team's tool overrides over the baseline, rejecting any loosening.
 
-    Two loosening routes are refused here:
-
-    * Softening a known tool's classification (destructive -> write, say). The
-      escalate-only ladder allows the reverse and nothing else.
-    * Introducing a tool the baseline does not classify. The baseline denies an
-      unclassified tool by default (R8); letting a team name a new tool would
-      turn that deny into an allow -- the subtle loosening R23 calls out. So a
-      team may only override keys the baseline already lists.
+    Refuses softening a known tool's classification and naming a tool the
+    baseline does not classify, which would turn the default deny into an allow.
     """
     merged = dict(baseline)
     for tool, new_class in (override.tools or {}).items():
@@ -194,17 +164,8 @@ def _tightened_limits(
 ) -> Limits:
     """Apply a team's limit and action overrides, rejecting any loosening.
 
-    * `destructive_per_hour` may only be LOWERED: a smaller allowance is
-      tighter. Raising it above the baseline would grant the team more
-      destructive calls than the gate's own ceiling.
-    * `approval_ttl_minutes` may only be LOWERED: a shorter-lived grant is
-      tighter. A longer TTL would widen the window in which a one-shot approval
-      can be redeemed.
-    * Each action may only move up pass -> approve -> block. Loosening an action
-      (block -> approve, approve -> pass) is refused.
-
-    A team cannot touch `unclassified_action`: it is not in the team schema, so
-    the deny-by-default for unknown tools is baseline-only and immutable (R23).
+    Caps and TTL may only be lowered and each action may only move up
+    pass -> approve -> block; unclassified_action stays baseline-only.
     """
     destructive_per_hour = baseline.destructive_per_hour
     if override.limits is not None and override.limits.destructive_per_hour is not None:
@@ -257,10 +218,8 @@ def _tightened_limits(
 def parse_policy_yaml(text: str) -> dict[str, Any]:
     """Parse the block-mapping subset of YAML that policy.yaml is written in.
 
-    Comments, nested block mappings and scalar leaves are supported and nothing
-    else, so an unexpected construct raises instead of being read as something
-    it is not. Keeping the grammar this small is what lets the gate ship with
-    only fastmcp and pydantic as runtime dependencies.
+    Only comments, nested block mappings and scalar leaves are supported, so an
+    unexpected construct raises. The tiny grammar keeps runtime deps minimal.
     """
     root: dict[str, Any] = {}
     frames: list[tuple[int, dict[str, Any]]] = [(0, root)]
@@ -374,9 +333,8 @@ class _PolicyLimits(BaseModel):
 class _TeamLimits(BaseModel):
     """A team's limit overrides. Both optional; both may only tighten.
 
-    Bounds match the baseline's (`ge=0` cap, `ge=1` TTL) so an override cannot
-    be individually nonsensical even before the tighten-only check compares it
-    to the baseline.
+    Bounds match the baseline's so an override cannot be nonsensical even before
+    the tighten-only check compares it to the baseline.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -388,10 +346,8 @@ class _TeamLimits(BaseModel):
 class _TeamOverride(BaseModel):
     """One team's override block: any subset of tools, actions, and limits.
 
-    `extra="forbid"` is what makes R23's "a team must not change
-    defaults.unclassified or defaults.annotations" structural: there is simply
-    no key for them here, so naming one is a validation error, not a value the
-    tighten-only logic has to special-case.
+    extra="forbid" makes "a team must not change the defaults" structural:
+    there is no key for them, so naming one is a validation error.
     """
 
     model_config = ConfigDict(extra="forbid")

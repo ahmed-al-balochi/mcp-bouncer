@@ -1,7 +1,6 @@
 """End-to-end, through a real FastMCP proxy in front of the real demo server.
-
-Every call in here goes over the MCP protocol via an in-memory transport, so the
-gate is exercised as a proxy and not as a function call.
+Every call goes over the MCP protocol via an in-memory transport, so the gate is
+exercised as a proxy and not as a function call.
 """
 
 from __future__ import annotations

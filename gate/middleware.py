@@ -1,14 +1,7 @@
 """The gate's single interception point for tool calls.
 
-One hook, `on_call_tool`: authenticate the caller, ask the policy, then forward,
-block, or park the call for a human. Every failure inside the hook blocks the
-call -- see `_FAIL_CLOSED`.
-
-Authentication lives entirely behind `IdentityResolver` (gate.identity): this
-module receives an already-resolved `Identity` and never parses a token itself.
-`_resolve_identity` is the one seam that changes when authentication changes
-(R21). The resolved team selects the per-team policy view from the registry, so
-the pure engine still does no lookups of its own (R23, R25).
+One hook, `on_call_tool`, authenticates the caller, asks the policy, then
+forwards, blocks, or parks the call. Every failure inside the hook blocks it.
 """
 
 from __future__ import annotations
@@ -62,17 +55,12 @@ class GateMiddleware(Middleware):
         try:
             identity = self._resolve_identity()
         except AuthenticationError as error:
-            # Rejected before classification (R18): the caller is not
-            # authenticated, so there is no identity to attribute the call to.
-            # The audit line records that an unauthenticated call was refused,
-            # never a token -- there is no token in scope here to leak.
+            # Rejected before classification: no authenticated identity to
+            # attribute the call to. The audit line records a refused
+            # unauthenticated call, never a token.
             tool = _peek_tool(context)
             self._audit_best_effort(tool, caller=UNREADABLE)
-            # The operational log records the SHAPE of the rejection, not the
-            # oracle-safe caller message and never a token. str(error) is the
-            # deliberately-uninformative "authentication failed" text, which is
-            # safe by construction; we log a fixed reason rather than risk it
-            # ever carrying detail.
+            # Log a fixed reason, not str(error), so no detail can ever leak.
             observability.log_auth_rejected(reason="authentication_failed", tool=tool)
             return _error(f"{BLOCKED}: {error}")
         except Exception:
@@ -128,13 +116,9 @@ class GateMiddleware(Middleware):
                     classification, caller, replace(state, grant_available=True), limits
                 )
             else:
-                # Stamp the CALLER'S effective TTL on the parked call. `limits`
-                # is the team's already-tightened view, so a team that shortened
-                # approval_ttl_minutes (CustomerChat: 5) gets a grant that
-                # actually lives 5 minutes, not the store's baseline 10 -- the
-                # gate is the only component that authoritatively knows the team
-                # at park time (R26, R23, bug D5.2). Seconds, because the store
-                # works in seconds.
+                # Stamp the caller's effective TTL on the parked call. The gate
+                # is the only component that knows the team at park time, so a
+                # team that shortened the TTL gets a grant that lives that long.
                 approval_id = self._approvals.create(
                     caller,
                     tool,
@@ -145,11 +129,9 @@ class GateMiddleware(Middleware):
         self._audit.record(
             caller, tool, classification, decision, args_hash(caller, tool, arguments)
         )
-        # The operational decision line mirrors the audit row for a live operator
-        # watching the stream, and carries the SAME argument hash -- never the
-        # arguments (R33). The audit trail above is the system of record; this is
-        # disposable stream data. Logging by hash is why no prompt content can
-        # reach the stream even here, on the allowed path.
+        # The operational decision line mirrors the audit row but carries the
+        # argument hash, never the arguments, so no prompt content reaches
+        # the stream even on the allowed path.
         observability.log_decision(
             caller=caller,
             team=identity.team,
@@ -166,19 +148,14 @@ class GateMiddleware(Middleware):
         )
 
     def _resolve_identity(self) -> Identity:
-        """Authenticate the caller. THE identity seam (R21).
+        """Authenticate the caller. The identity seam.
 
-        This is the one method that knows a request has to be turned into an
-        identity, and even it does not know how: it hands the request headers to
-        the configured `IdentityResolver` and takes back an `Identity`. Over
-        stdio the resolver trusts the spawning process's `--caller`; over HTTP it
-        authenticates a bearer token. Swapping the mechanism is a change to
-        gate.identity and to nothing here.
+        Hands the request headers to the configured `IdentityResolver` and takes
+        back an `Identity`. Swapping the mechanism changes only gate.identity.
         """
-        # FastMCP strips `authorization` from get_http_headers() by default,
-        # because it normally must not be forwarded to an upstream. The gate is
-        # exactly the component that consumes it, so it opts the header back in
-        # here -- and only here -- for the resolver to authenticate.
+        # FastMCP strips `authorization` from get_http_headers() by default so
+        # it is not forwarded upstream. The gate is the component that consumes
+        # it, so it opts the header back in here, and only here.
         return self._identity_resolver.resolve(get_http_headers(include={"authorization"}))
 
     async def _annotations(
@@ -211,7 +188,7 @@ class GateMiddleware(Middleware):
                 f"{APPROVAL_REQUIRED} id={approval_id} :: {tool} is classified"
                 f" '{classification}' and needs human approval before it runs."
                 f" Ask an approver to run: bouncer approve {approval_id}"
-                " -- then retry this call unchanged. The approval covers these exact"
+                " then retry this call unchanged. The approval covers these exact"
                 f" arguments only, and expires in"
                 f" {limits.approval_ttl_minutes} minutes."
             )

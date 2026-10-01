@@ -1,20 +1,7 @@
 """A toy upstream MCP server, so the gate has something real to sit in front of.
 
-`delete_page` carries `destructiveHint: true`. The gate reads that hint but does
-not depend on it: policy.yaml already classifies the tool as destructive, and the
-hint is only allowed to escalate.
-
-`rename_page` is here ON PURPOSE and is deliberately absent from policy.yaml. It
-is the honest, realistic case of R8/A2: an upstream grows a new tool before the
-policy has classified it. Because it matches no entry in policy.yaml, the gate
-classifies it `unknown` and denies it -- a gate that allowed what it cannot
-classify would not be a gate. Keeping it a REAL, working upstream tool (rather
-than a name that does not exist) is what lets the unknown-tool denial be shown
-with a model in the loop: the model sees `rename_page` in the catalogue, calls
-it, and the gate blocks it before it can run. It carries NO annotations -- a
-lying `readOnlyHint` would neither help (R9 forbids a hint promoting an unlisted
-tool into a permitted class, and that is already covered by tests) nor be honest
-to a reader of the demo.
+`delete_page` carries `destructiveHint: true`, which the gate only lets escalate.
+`rename_page` is absent from policy.yaml, so the gate denies it as `unknown`.
 """
 
 from __future__ import annotations

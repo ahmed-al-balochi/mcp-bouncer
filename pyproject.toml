@@ -16,45 +16,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# boto3 is the only AWS client the gate uses, and two separate parts of it need
-# one: the DynamoDB approval store and audit log, which back the gate when it is
-# scaled across hosts and there is no shared SQLite file to hold the one-shot
-# guarantee (R27) or the append-only trail (R29), and the Secrets Manager token
-# source, which resolves bearer tokens at boot so no credential is ever baked
-# into the image (R19). The extra is named for the dependency's scope rather than
-# for one of its two consumers.
-#
-# It is OPTIONAL, not a hard dependency, so the default SQLite path and the local
-# token source -- and `import gate.approvals` -- never require it (R44). Both
-# consumers import boto3 lazily, so installing this is only necessary to select
-# an AWS-backed store or token source.
+# boto3, for the DynamoDB stores and the Secrets Manager token source. Optional
+# and imported lazily, so the default SQLite and local-token path never needs it.
 aws = ["boto3>=1.34,<2"]
-# The `openai` SDK is what the real-LLM demo agent (demo/llm_agent.py) uses to
-# call the deployed LiteLLM gateway's OpenAI-compatible /v1/chat/completions.
-# LiteLLM presents the OpenAI chat-completions API for every backend and
-# translates to Bedrock Converse, so the agent speaks OpenAI format even though
-# the model is Claude on Bedrock (D6.17). Using the SDK rather than hand-rolled
-# urllib buys tested request/error handling and a client that reads like real
-# usage.
-#
-# It is OPTIONAL, and its whole reason to be separate is that the gate image
-# must never install it: the demo agent needs Bedrock and is not part of the
-# gate's runtime (it is not added to the Dockerfile). Keeping the gate's image
-# slim (R44) is the point of the extra.
-#
-# Pinned EXACTLY: 3.19.2 is the newest release that installs cleanly alongside
-# fastmcp==4.0.1 in .venv without changing any already-installed package. It
-# shares fastmcp's httpx2/anyio/pydantic stack (openai 3.x depends on
-# `httpx2<3,>=2.12.0`, the same fork fastmcp uses), so the only packages it adds
-# are `openai`, `jiter` and `sniffio` -- fastmcp, httpx2, pydantic and mcp are
-# untouched. Verified with `uv pip install --dry-run` (see the G2 report).
+# The openai SDK, for demo/llm_agent.py only, so the gate image never installs it.
+# Pinned to 3.19.2: the newest release that sits alongside fastmcp 4.0.1
+# without changing any installed package.
 llm-demo = ["openai==3.19.2"]
 # moto fakes DynamoDB and Secrets Manager in-process, so the AWS-backed paths are
-# proven against the same contracts as the local ones (A8) with no AWS
-# credentials and no network (R45). `openai` is here too because the offline
-# demo-agent tests point the real SDK at a stdlib fake server on 127.0.0.1 and
-# assert on exactly what it puts on the wire -- the gate's own runtime deps are
-# untouched by this.
+# proven against the same contracts as the local ones with no AWS credentials and
+# no network. `openai` is here for the offline demo-agent tests against a fake.
 test = [
     "pytest>=8,<10",
     "boto3>=1.34,<2",

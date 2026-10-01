@@ -1,38 +1,7 @@
-"""A DynamoDB-backed approval store, behind the same interface as the SQLite one.
+"""A DynamoDB-backed approval store, behind the same interface as SQLite.
 
-Why this exists: SQLite gives the one-shot guarantee only across processes that
-share one file, so a horizontally scaled gate -- many Fargate tasks, no shared
-disk -- needs a store whose atomic claim holds across hosts. DynamoDB's
-conditional writes provide exactly that (R27).
-
-The whole file is written to satisfy `gate.storage.ApprovalStore` structurally;
-it adds nothing to that surface. boto3 is imported lazily inside `__init__`, not
-at module import, so that `import gate.approvals`, the factory, and the entire
-SQLite path never require boto3 to be installed (R44).
-
-Key schema (single table, two GSIs). Every access pattern is a GetItem or a
-Query with a key condition -- never a Scan, and never a filter standing in for a
-key:
-
-    Grant        PK = GRANT#<args_hash>          SK = GRANT
-                 caller, tool, expires_at (epoch seconds), ttl (native TTL attr)
-    Pending      PK = PENDING#<id>               SK = PENDING
-                 caller, tool, arguments, args_hash, created_at, state
-                 GSI1PK = PENDING                GSI1SK = <created_at, zero-padded>
-                 GSI2PK = PENDINGHASH#<args_hash> GSI2SK = <id>
-    Release      PK = RELEASE#<caller>           SK = <released_at, zero-padded>#<args_hash>
-
-* consume     -> conditional DeleteItem on the Grant item's exact key, so of any
-                 number of concurrent callers exactly one deletes it and sees
-                 success. The same condition rejects an expired grant that TTL
-                 has not yet swept (R28).
-* list_pending-> Query GSI1 (GSI1PK = PENDING), ordered by created_at.
-* create dedup-> Query GSI2 (GSI2PK = PENDINGHASH#<hash>) for an existing pending
-                 row before inserting a new one.
-* approve/deny-> GetItem / conditional UpdateItem by the Pending item's key.
-* approved_in_window -> Query the RELEASE#<caller> partition with an SK range
-                 condition `SK > cutoff`. A key range, not a Scan, not a filter.
-* reset       -> Query then delete that caller's RELEASE partition.
+A scaled gate has no shared disk, so the atomic claim must hold across hosts via
+conditional writes. boto3 is imported lazily and every access is a key read.
 """
 
 from __future__ import annotations
@@ -57,10 +26,10 @@ from gate.dynamodb_keys import numeric_sk as _numeric_sk
 
 
 class DynamoDBApprovalStore:
-    """Approval state on DynamoDB, matching `gate.storage.ApprovalStore` exactly.
+    """Approval state on DynamoDB, matching gate.storage.ApprovalStore exactly.
 
-    The clock is injectable for the same reason the SQLite store's is: TTL and
-    rolling-window behaviour must be testable without waiting real minutes.
+    The clock is injectable, like the SQLite store's, so TTL and rolling-window
+    behaviour can be tested without waiting real minutes.
     """
 
     def __init__(
@@ -71,10 +40,9 @@ class DynamoDBApprovalStore:
         clock: Callable[[], float] = time.time,
         region_name: str | None = None,
     ) -> None:
-        # Lazy import: boto3 is an optional extra, so nothing that only touches
-        # the SQLite path should pay for it. Import failure here means the
-        # operator selected the DynamoDB backend without installing the extra,
-        # and the message says exactly that.
+        # Lazy import: boto3 is an optional extra, so the SQLite path should not
+        # pay for it. A failure here means the operator selected DynamoDB without
+        # installing the extra, and the message says exactly that.
         try:
             import boto3
         except ImportError as error:  # pragma: no cover - exercised via message
@@ -83,9 +51,8 @@ class DynamoDBApprovalStore:
                 "install with `pip install mcp-bouncer[aws]`"
             ) from error
 
-        # Region comes from the standard AWS environment (AWS_REGION /
-        # AWS_DEFAULT_REGION), not a bespoke variable, so the container inherits
-        # it like every other AWS SDK call does.
+        # Region comes from the standard AWS environment, so the container
+        # inherits it like every other AWS SDK call does.
         self._ttl_seconds = float(ttl_minutes) * 60.0
         self._clock = clock
         self._client = boto3.client(
@@ -102,10 +69,8 @@ class DynamoDBApprovalStore:
     def _effective_ttl(self, stored: Mapping[str, Any] | None) -> float:
         """Resolve a stored TTL attribute, falling back to the store default.
 
-        `stored` is the DynamoDB attribute dict (`{"N": "..."}`) or None when the
-        item carries no `ttl_seconds` -- written before this change, or by a
-        caller that stamped none. Absent means the store default (the baseline),
-        the same fallback the SQLite store uses (R26, D5.2).
+        An item carries no ttl_seconds when written before this change or stamped
+        with none; absent means the store default, as in the SQLite store.
         """
         return float(stored["N"]) if stored is not None else self._ttl_seconds
 
@@ -119,25 +84,8 @@ class DynamoDBApprovalStore:
     ) -> PendingApproval:
         """Park a call, reusing an existing pending row for an identical call.
 
-        Dedup is a GSI2 Query on the args_hash, mirroring the SQLite store's
-        "reuse the pending row" behaviour so a retrying agent does not stack up
-        duplicate approvals for one call.
-
-        `ttl_seconds` is the caller's effective grant lifetime, persisted on the
-        pending item so `approve` computes the grant's expiry from it rather than
-        from the store default (R26, D5.2). `None` means "use the store default"
-        (the baseline). On dedup reuse the stored TTL is tightened DOWN to the
-        incoming one when the incoming one is shorter, and never widened, so a
-        reused row is never LOOSER than the tightest team that asked for it --
-        the same rule as the SQLite store.
-
-        One deliberate difference from SQLite: global secondary indexes are
-        eventually consistent, so an agent retrying within milliseconds can miss
-        a pending row that was just written and park a second one. That is
-        cosmetic -- a duplicate row for a human to look at -- and it cannot
-        weaken the one-shot guarantee, because releasing a call goes through the
-        conditional delete in `consume`, which is strongly consistent and keyed
-        on the item itself rather than on an index.
+        Dedup is a GSI2 Query on the args_hash so a retry does not stack approvals.
+        ttl_seconds is persisted for approve and on reuse only tightens down.
         """
         digest = args_hash(caller, tool, arguments)
         existing = self._pending_item_for_hash(digest)
@@ -172,7 +120,7 @@ class DynamoDBApprovalStore:
             "GSI2SK": {"S": record.id},
         }
         # Only write the TTL attribute when one was stamped; its absence is how a
-        # row signals "use the store default", read back as None (R26).
+        # row signals "use the store default", read back as None.
         if ttl_seconds is not None:
             item["ttl_seconds"] = {"N": repr(float(ttl_seconds))}
         self._client.put_item(TableName=self._table, Item=item)
@@ -181,12 +129,10 @@ class DynamoDBApprovalStore:
     def _tighten_pending_ttl(
         self, existing: Mapping[str, Any], incoming_ttl: float | None
     ) -> None:
-        """Lower a reused pending item's stored TTL to `incoming_ttl` if stricter.
+        """Lower a reused pending item's stored TTL to incoming_ttl if stricter.
 
-        Mirrors the SQLite dedup rule: None (store default) never tightens; the
-        effective stored value is the stamped TTL or the store default; we only
-        shorten, never widen, so the reused row can never become looser than the
-        caller's team TTL.
+        Mirrors the SQLite dedup rule: None never tightens, and we only shorten,
+        never widen, so a reused row never becomes looser than the caller's team.
         """
         if incoming_ttl is None:
             return
@@ -203,11 +149,10 @@ class DynamoDBApprovalStore:
             )
 
     def approve(self, approval_id: str) -> PendingApproval | None:
-        """Grant one retry of the parked call. Returns None if there is nothing to grant.
+        """Grant one retry of the parked call, or None if there is nothing to grant.
 
-        Moving the pending row to APPROVED is a conditional update guarded on the
-        row still being PENDING, so a denied or already-approved id yields None
-        rather than resurrecting a decision.
+        A conditional update guarded on the row still being PENDING, so a denied
+        or already-approved id yields None rather than resurrecting a decision.
         """
         item = self._get_pending(approval_id)
         if item is None or item.get("state", {}).get("S") != PENDING:
@@ -230,12 +175,9 @@ class DynamoDBApprovalStore:
 
         effective_ttl = self._effective_ttl(item.get("ttl_seconds"))
         expires_at = self._clock() + effective_ttl
-        # The grant item carries both `expires_at` (checked in the claim
-        # condition) and `ttl` (DynamoDB's native TTL attribute). Both are
-        # computed from the parked row's per-row TTL -- the caller's effective,
-        # possibly team-tightened, lifetime -- NOT the store default (R26, D5.2),
-        # so the native TTL attribute MATCHES the per-row expiry. TTL cleans up
-        # eventually; the claim condition enforces expiry immediately (R28).
+        # The grant carries expires_at (checked in the claim condition) and ttl
+        # (native TTL), both from the parked row's per-row TTL, not the store
+        # default. The claim enforces expiry immediately; native TTL can lag.
         self._client.put_item(
             TableName=self._table,
             Item={
@@ -275,16 +217,8 @@ class DynamoDBApprovalStore:
     def consume(self, caller: str, tool: str, arguments: Mapping[str, Any]) -> bool:
         """Claim the grant for this exact call, at most once, ever.
 
-        This is the whole point of the DynamoDB backend. The claim is a single
-        conditional DeleteItem: DynamoDB evaluates the condition and removes the
-        item atomically, so of any number of concurrent tasks -- on any number of
-        hosts -- exactly one sees the delete succeed and every other gets
-        ConditionalCheckFailed. There is no read-then-delete window for two tasks
-        to both pass.
-
-        The condition also enforces expiry in the same breath (`expires_at > now`
-        and matching caller/tool), so a grant that TTL has not yet physically
-        removed is still refused the instant it is stale (R28).
+        One conditional DeleteItem, so exactly one of many concurrent tasks wins.
+        The condition also checks expires_at, so a stale grant is refused.
         """
         digest = args_hash(caller, tool, arguments)
         now = self._clock()
@@ -303,23 +237,14 @@ class DynamoDBApprovalStore:
                 },
             )
         except self._client.exceptions.ConditionalCheckFailedException:
-            # Also the path taken if the SDK retried a delete whose success
-            # response was lost: the item is already gone, so the condition fails
-            # and the true winner is told no. That over-denies -- the call parks
-            # again and a human re-approves -- which is the safe direction. It can
-            # never release twice, which is the guarantee that matters.
+            # Also taken if a retried delete's success response was lost: the
+            # item is already gone, so the winner is told no. Over-denying is the
+            # safe direction; it can never release twice, which is what matters.
             return False
 
-        # Only the single winner reaches here, so recording the release and
-        # marking the pending row consumed happen exactly once per grant.
-        #
-        # The sort key carries the argument digest as well as the timestamp. Two
-        # different grants claimed by one caller within the same clock tick would
-        # otherwise write the same PK and SK, and the second PutItem would
-        # silently overwrite the first -- undercounting the rolling window and
-        # letting the caller slip past the destructive rate cap (R14). The digest
-        # cannot itself collide here, because a grant is one-shot: the same
-        # digest can only be claimed once.
+        # Only the winner reaches here, so the release and the consumed mark
+        # happen once per grant. The SK carries the digest as well as the time so
+        # two claims in the same tick cannot overwrite each other.
         self._client.put_item(
             TableName=self._table,
             Item={
@@ -336,9 +261,8 @@ class DynamoDBApprovalStore:
     def expire(self) -> int:
         """Drop grants past their TTL and mark stale pending rows expired.
 
-        DynamoDB's native TTL is asynchronous and can lag by hours, so this
-        method does the same eager sweep the SQLite store does rather than
-        trusting TTL for correctness. Returns the number of grants dropped.
+        DynamoDB's native TTL can lag by hours, so this eager sweep does not
+        trust it for correctness. Returns the number of grants dropped.
         """
         now = self._clock()
         dropped = 0
@@ -353,11 +277,9 @@ class DynamoDBApprovalStore:
         for item in self._all_pending():
             if item.get("state", {}).get("S") not in (PENDING, APPROVED):
                 continue
-            # Per-row staleness: a parked row is stale once its own TTL has
-            # elapsed since it was created, falling back to the store default
-            # when it carries no stamped TTL (R26, D5.2). Using the store-wide
-            # default for every row would keep a CustomerChat park (5 min) alive
-            # for the baseline 10 -- the bug this fixes.
+            # A parked row is stale once its own TTL has elapsed since it was
+            # created, falling back to the store default when it carries none.
+            # Using the store default for every row is the bug this fixes.
             row_ttl = self._effective_ttl(item.get("ttl_seconds"))
             if float(item["created_at"]["N"]) + row_ttl <= now:
                 self._client.update_item(
@@ -394,10 +316,8 @@ class DynamoDBApprovalStore:
     ) -> int:
         """Count a caller's released destructive actions in the rolling window.
 
-        A Query on the RELEASE#<caller> partition with the sort-key range
-        condition `SK > cutoff`. Because releases are stored under a per-caller
-        partition keyed by time, this is a bounded key-range read of one caller's
-        recent activity -- never a Scan, never a filter over the whole table.
+        A Query on the RELEASE#<caller> partition with the SK range SK > cutoff,
+        a bounded key-range read of one caller's recent activity, never a Scan.
         """
         cutoff = self._clock() - window_seconds
         return len(self._query_releases(caller, since=cutoff))
@@ -407,8 +327,8 @@ class DynamoDBApprovalStore:
     def _pending_item_for_hash(self, digest: str) -> dict[str, Any] | None:
         """Return the raw pending item for an args hash, or None.
 
-        Raw item rather than a PendingApproval so `create` can both read the
-        stored TTL and address the item's key to tighten it on dedup (R26).
+        Raw item rather than a PendingApproval so create can read the stored TTL
+        and address the item's key to tighten it on dedup.
         """
         response = self._client.query(
             TableName=self._table,
@@ -468,11 +388,9 @@ class DynamoDBApprovalStore:
             key = "PK = :pk"
             values = {":pk": {"S": f"RELEASE#{caller}"}}
         else:
-            # The cutoff has no digest suffix, so a release recorded at exactly
-            # the cutoff instant sorts after it and counts as inside the window.
-            # The SQLite store excludes that single instant; at microsecond
-            # resolution the difference is not observable, and counting a release
-            # as inside the window is the stricter of the two readings.
+            # The cutoff has no digest suffix, so a release at exactly the cutoff
+            # instant sorts after it and counts as inside the window. SQLite
+            # excludes that instant; the difference is not observable here.
             key = "PK = :pk AND SK > :cutoff"
             values = {
                 ":pk": {"S": f"RELEASE#{caller}"},
@@ -498,10 +416,9 @@ def _as_pending(
     state: str | None = None,
     ttl_seconds: float | None = None,
 ) -> PendingApproval:
-    # `ttl_seconds` argument, when given, overrides the item's stored value so
-    # `approve` can report the RESOLVED grant lifetime (default-filled); when not
-    # given, the item's own stamped TTL (or None if absent) is carried through
-    # (R26).
+    # When given, ttl_seconds overrides the item's stored value so approve can
+    # report the resolved grant lifetime; when not, the item's own stamped TTL
+    # (or None if absent) is carried through.
     stored = item.get("ttl_seconds")
     stored_ttl = float(stored["N"]) if stored is not None else None
     return PendingApproval(

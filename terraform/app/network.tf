@@ -1,13 +1,6 @@
-# Dedicated VPC, private tasks, NO NAT, VPC endpoints only (D4.4, option 3).
-#
-# The task only ever talks to AWS services -- ECR (pull), S3 (image layers),
-# CloudWatch Logs, Secrets Manager, DynamoDB -- so it needs no route to the
-# internet at all. The public subnets exist ONLY for the ALB; the private
-# subnets that run the tasks have a route table with no default route and no NAT
-# gateway, so "the proxy has no path to the internet" is a property the network
-# enforces, not a claim (D4.4). Any unexpected outbound call at boot fails
-# rather than silently working -- an accepted risk, treated as an empirical test
-# of the no-egress claim.
+# Dedicated VPC, private tasks, no NAT, VPC endpoints only. The task only talks
+# to AWS services, so the private subnets have no default route and no NAT: "no
+# path to the internet" is enforced by the network, not merely claimed.
 
 resource "aws_vpc" "this" {
   cidr_block = var.vpc_cidr
@@ -80,10 +73,9 @@ resource "aws_subnet" "private" {
   tags = { Name = "${var.project_name}-private-${local.azs[tonumber(each.key)]}" }
 }
 
-# The private route table has NO default route and NO NAT gateway. The only
-# routes it will carry are the two gateway endpoints (S3 and DynamoDB), added in
-# endpoints.tf as aws_vpc_endpoint associations. Everything else -- including any
-# accidental internet call -- has nowhere to go (D4.4).
+# The private route table has no default route and no NAT gateway. Its only
+# routes are the two gateway endpoints (S3 and DynamoDB), added in endpoints.tf;
+# everything else, including any accidental internet call, has nowhere to go.
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.this.id
 

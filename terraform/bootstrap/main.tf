@@ -1,14 +1,6 @@
-# Bootstrap stack: the two things that must outlive the application stack.
-#
-# The DNS zone must survive because its name servers are what the registrar
-# delegates to. Destroying and recreating the zone issues a different set, and
-# the delegation has to be re-pasted at the registrar by hand every time. So the
-# zone is created once here and the application stack only reads it.
-#
-# The image repository must survive for the same class of reason: destroying it
-# deletes the image, and the next apply would have nothing to run until someone
-# rebuilds and pushes. Keeping it here makes `terraform destroy` on the
-# application stack cheap and repeatable.
+# Bootstrap stack: the two things that must outlive the application stack. The
+# DNS zone must survive because the registrar delegates to its name servers; the
+# image repository must survive because destroying it deletes the image.
 
 locals {
   tags = merge(
@@ -35,10 +27,9 @@ resource "aws_route53_zone" "this" {
 resource "aws_ecr_repository" "this" {
   name = var.project_name
 
-  # MUTABLE so a rebuilt image can reuse the same tag during a POC. The previous
-  # image is orphaned as untagged and reaped by rule 1 of the lifecycle policy
-  # below. An immutable tag policy would be the right call for a real release
-  # process, where every build gets its own tag.
+  # MUTABLE so a rebuilt image can reuse the same tag during a POC; the previous
+  # image is orphaned as untagged and reaped by the lifecycle policy below. An
+  # immutable tag policy would be right for a real release process.
   image_tag_mutability = "MUTABLE"
 
   # Guards against `terraform destroy` silently taking the image with it.
@@ -87,17 +78,11 @@ resource "aws_ecr_lifecycle_policy" "this" {
   })
 }
 
-# --- LiteLLM image repository (G1, D6.10) ----------------------------------
-#
-# A SECOND repository, for the thin LiteLLM gateway image, kept separate from
-# the gate's repository on purpose (D6.10): the gateway's execution role can
-# then be scoped to pull only this repository, and the two images never mix
-# under one tag. Additive to this stack -- the existing zone, certificate and
-# gate repository are untouched, so applying this changes nothing that already
-# exists. Every setting mirrors aws_ecr_repository.this so the two repositories
-# are governed identically (MUTABLE tags for tag reuse during a POC,
-# scan_on_push, AES256 at rest, force_delete off, prevent_destroy so a teardown
-# cannot take the image with it).
+# --- LiteLLM image repository ----------------------------------------------
+
+# A second repository, for the thin LiteLLM gateway image, kept separate from the
+# gate's so the gateway's execution role pulls only this one and the two images
+# never mix under a tag. Every setting mirrors aws_ecr_repository.this.
 resource "aws_ecr_repository" "litellm" {
   name = "${var.project_name}-litellm"
 

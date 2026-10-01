@@ -1,9 +1,6 @@
 """Per-team policy: overrides may only tighten, and any loosening refuses boot.
-
-R22-R25, A7. Each loosening route gets its own test so a regression names the
-exact hole it reopened. The tightening side is proven both here (the view is
-computed correctly) and end-to-end in tests/test_identity_lifecycle.py (a
-tightened override actually parks a call through the real proxy).
+Each loosening route gets its own test so a regression names the
+hole; tightening is also proven end-to-end in tests/test_identity_lifecycle.py.
 """
 
 from __future__ import annotations
@@ -93,26 +90,17 @@ def test_devchat_keeps_write_and_only_lowers_its_cap(policy_path: Path):
     assert view.limits.approval_ttl_minutes == 10
 
 
-# --- glob shadowing, the subtlest loosening route -------------------------
-#
-# Classification is decided by exact match first and then by the first matching
-# glob in file order. So a team does not have to name a tool to weaken it: it can
-# introduce a broader pattern and hope the pattern wins, or introduce a narrower
-# exact name that beats a stricter glob. Both are loosening by precedence rather
-# than by value, which is why neither is caught by comparing severities alone.
-# The registry blocks them by refusing any key the baseline does not already
-# list; these tests exist so that rule cannot be relaxed without a failure that
-# names the hole.
+# Glob shadowing is the subtlest loosening route: a team can weaken a tool via a
+# broader glob that wins or a narrower exact name that beats a stricter glob. The
+# registry blocks both by refusing any key the baseline does not already list.
 
 
 def test_a_team_cannot_introduce_a_broader_glob_that_shadows_a_strict_tool(
     tmp_path: Path,
 ):
     """`wiki.*: write` alongside a baseline `wiki.delete_page: destructive`.
-
-    Nothing here lowers a value the baseline states, so a severity comparison
-    would wave it through. The loosening is positional: a permissive pattern is
-    introduced that could match a tool the baseline classifies more strictly.
+    Nothing lowers a stated value, so a severity check would pass it; the
+    loosening is positional. Refused because the baseline does not list the key.
     """
     policy = _with_team('  DevChat:\n    tools:\n      "wiki.*": write\n')
 
@@ -125,10 +113,8 @@ def test_a_team_cannot_add_an_exact_name_that_undercuts_a_stricter_glob(
     tmp_path: Path,
 ):
     """A baseline glob of `write` plus a team's exact `wiki.read_page: read`.
-
-    The exact name outranks the glob at classification time, so this lowers
-    `wiki.read_page` from write to read without ever editing the glob. Refused,
-    because the baseline does not list that key.
+    The exact name outranks the glob, lowering wiki.read_page without editing the
+    glob. Refused because the baseline does not list that key.
     """
     policy = (
         GLOB_BASE
@@ -142,9 +128,8 @@ def test_a_team_cannot_add_an_exact_name_that_undercuts_a_stricter_glob(
 
 def test_a_team_may_still_tighten_a_glob_the_baseline_itself_lists(tmp_path: Path):
     """The rule bites on introduction, not on tightening: a listed glob is fair game.
-
-    Without this, the previous two tests would be satisfied by a registry that
-    simply banned every team tool override, which would make the feature useless.
+    Without this, the two tests above would be satisfied by a registry that
+    banned every team tool override, making the feature useless.
     """
     policy = (
         GLOB_BASE
@@ -192,7 +177,7 @@ def test_a_team_may_hold_a_limit_at_the_baseline(tmp_path: Path):
     assert registry.for_team("Same").limits.destructive_per_hour == 3
 
 
-# --- one test per loosening route (A7) ------------------------------------
+# --- one test per loosening route ------------------------------------
 
 
 def test_loosening_a_classification_prevents_boot(tmp_path: Path):
@@ -228,7 +213,7 @@ def test_loosening_an_action_prevents_boot(tmp_path: Path):
 
 def test_introducing_an_unclassified_tool_prevents_boot(tmp_path: Path):
     """The subtle route: a team naming a tool the baseline does not classify
-    turns a default-deny into an allow, so it must refuse to boot (R23)."""
+    turns a default-deny into an allow, so it must refuse to boot."""
     policy = _with_team(
         '  Bad:\n    tools:\n      "payments.refund": read\n'
     )

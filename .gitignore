@@ -12,7 +12,7 @@ build/
 dist/
 .pytest_cache/
 
-# Terraform. The lock file IS committed on purpose -- it pins provider hashes.
+# Terraform. The lock file is committed on purpose: it pins provider hashes.
 .terraform/
 *.tfstate
 *.tfstate.*
@@ -32,3 +32,6 @@ tokens.json
 # Local working documents, not part of the repo: the session handoff and carried
 # findings. Anything *.local.md is scaffolding for building this, not a deliverable.
 *.local.md
+
+# The requirements contract is a working file between the owner and the agent.
+REQUIREMENTS.md

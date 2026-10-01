@@ -60,11 +60,9 @@ class PendingApproval:
     args_hash: str
     created_at: float
     state: str
-    # The grant's effective lifetime in seconds. On a row returned from `create`
-    # / `list_pending` this is the stamped per-row TTL (or None when the row uses
-    # the store default). On the record `approve` returns it is the resolved TTL
-    # the grant was actually written with, so the CLI can print the REAL lifetime
-    # of the grant it just created rather than the store's baseline (R26, D5.2).
+    # The grant's effective lifetime in seconds. On a row from `create` or
+    # `list_pending` this is the stamped per-row TTL, or None for the store
+    # default. On the record `approve` returns it is the resolved TTL used.
     ttl_seconds: float | None = None
 
 
@@ -89,19 +87,8 @@ def args_hash(caller: str, tool: str, arguments: Mapping[str, Any]) -> str:
 class ApprovalStore:
     """The gate's approval state, behind a deliberately narrow interface.
 
-    Production swap: nothing outside this class knows the storage engine, so
-    SQLite can be replaced without touching the policy or the middleware.
-
-    * DynamoDB -- grants become items keyed on `args_hash` with a native TTL
-      attribute doing the expiry, and `consume` becomes a conditional
-      `DeleteItem` on `attribute_exists(args_hash)`. The condition gives the same
-      single-winner guarantee as the `DELETE ... WHERE` below.
-    * Postgres -- `DELETE ... RETURNING` under READ COMMITTED, with a periodic
-      sweep for expiry.
-
-    Single-node SQLite is enough for this MVP but not for a horizontally scaled
-    gate: the one-shot guarantee holds across processes on a shared file, not
-    across hosts with separate files.
+    Nothing outside this class knows the storage engine, so SQLite can be
+    swapped out. The one-shot guarantee holds on a shared file, not across hosts.
     """
 
     def __init__(
@@ -123,10 +110,8 @@ class ApprovalStore:
     def _effective_ttl(self, stored: float | None) -> float:
         """Resolve a row's stamped TTL, falling back to the store default.
 
-        A NULL/None stored TTL means the row was parked without a stamped value
-        (either before this change, or by a caller that passed no TTL), so it
-        gets the store default -- the baseline. This is the one place the
-        fallback lives, so `approve` and the dedup tighten agree on it.
+        A None stored TTL means no stamped value, so it gets the baseline. This
+        is the one place the fallback lives, so `approve` and `expire` agree.
         """
         return stored if stored is not None else self._ttl_seconds
 
@@ -140,19 +125,8 @@ class ApprovalStore:
     ) -> PendingApproval:
         """Park a call, reusing an existing pending row for an identical call.
 
-        `ttl_seconds` is the caller's effective grant lifetime, stamped on the
-        row so `approve` and `expire` use it rather than the store default (R26,
-        D5.2). `None` means "use the store default" (the baseline), so callers
-        that do not pass it keep the previous behaviour.
-
-        Dedup decision (must never end up LOOSER than the caller's team TTL):
-        when an identical call is already parked we reuse its row, but if this
-        caller's TTL is SHORTER than the one already stored we tighten the row
-        down to it. Reuse keeps a retrying agent from stacking duplicate
-        approvals; tightening-on-reuse keeps the invariant that a stored TTL is
-        never looser than the tightest team that asked for it. We never widen a
-        stored TTL on reuse -- that would loosen it -- so a looser (or absent,
-        meaning baseline) incoming TTL leaves the stricter stored value alone.
+        `ttl_seconds` is the caller's effective grant lifetime, stamped so
+        `approve` and `expire` use it. On reuse the stored TTL is only tightened.
         """
         digest = args_hash(caller, tool, arguments)
         with self._transaction() as connection:
@@ -199,12 +173,8 @@ class ApprovalStore:
     ) -> None:
         """Lower a reused pending row's stored TTL to `incoming_ttl` if stricter.
 
-        `incoming_ttl` None means the caller wants the store default, which is
-        never stricter than an already-stamped shorter value, so it leaves the
-        row untouched. The effective TTL of a NULL stored value is the store
-        default, so we only shorten when the incoming value is strictly less than
-        whatever the row would resolve to today. This can only ever move a stored
-        TTL down, never up (never looser).
+        None means use the store default, so the row is left alone. We shorten
+        only when `incoming_ttl` is less than what the row resolves to, never up.
         """
         if incoming_ttl is None:
             return
@@ -228,9 +198,8 @@ class ApprovalStore:
                 "UPDATE pending SET state = ? WHERE id = ?", (APPROVED, approval_id)
             )
             # The grant's lifetime is the TTL stamped on the parked row (the
-            # caller's effective, possibly team-tightened, TTL), NOT the store
-            # default (R26, D5.2). A row written before this change has no stamped
-            # TTL, so it falls back to the store default -- the baseline.
+            # caller's effective TTL), not the store default. A row with no
+            # stamped TTL falls back to the baseline.
             effective_ttl = self._effective_ttl(row["ttl_seconds"])
             connection.execute(
                 "INSERT INTO grants (args_hash, approval_id, caller, tool, expires_at)"
@@ -258,9 +227,8 @@ class ApprovalStore:
     def consume(self, caller: str, tool: str, arguments: Mapping[str, Any]) -> bool:
         """Claim the grant for this exact call, at most once, ever.
 
-        The claim is the `DELETE`: SQLite applies it inside a write transaction,
-        so of any number of concurrent callers exactly one sees rowcount 1 and
-        the row is gone before anyone else looks. A replayed call finds nothing.
+        The claim is the `DELETE` inside a write transaction, so exactly one of
+        any concurrent callers sees rowcount 1. A replayed call finds nothing.
         """
         digest = args_hash(caller, tool, arguments)
         now = self._clock()
@@ -285,13 +253,8 @@ class ApprovalStore:
     def expire(self) -> int:
         """Drop grants past their TTL and mark stale rows expired.
 
-        Grants already carry an absolute `expires_at` computed from the per-row
-        TTL at approve time, so sweeping them stays a simple `expires_at <= now`.
-        Pending rows carry the TTL itself, so their staleness is per-row too:
-        a row is stale once `created_at + its own TTL <= now`, falling back to
-        the store default when the row has no stamped TTL (R26, D5.2). Using the
-        store-wide default for every pending row would keep a CustomerChat park
-        (5 min) alive for the baseline 10 -- the very bug this fixes.
+        Grants carry an absolute `expires_at`, so sweeping is a simple compare.
+        Pending rows are stale once `created_at + their own TTL <= now`.
         """
         now = self._clock()
         with self._transaction() as connection:
@@ -340,14 +303,9 @@ class ApprovalStore:
             connection.close()
 
     def _migrate_pending_ttl(self, connection: sqlite3.Connection) -> None:
-        # Per-row TTL migration (R26, bug D5.2). `pending` predates the per-row
-        # TTL column, so a database written before this change has rows without
-        # it. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we ask the table what
-        # columns it has and add the nullable column only when it is missing --
-        # idempotent, and safe to run on every boot. It is nullable on purpose:
-        # a NULL means "no stamped TTL", which `approve` and `expire` read as the
-        # store default (the baseline), so old rows keep their old lifetime and
-        # nothing has to be backfilled.
+        # Per-row TTL migration. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we
+        # add the nullable column only when missing: idempotent and safe on every
+        # boot. NULL means "no stamped TTL", read as the store default.
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(pending)").fetchall()
@@ -381,11 +339,9 @@ class ApprovalStore:
 def _as_pending(
     row: sqlite3.Row, state: str | None = None, ttl_seconds: float | None = None
 ) -> PendingApproval:
-    # `ttl_seconds` argument, when given, overrides the row's stored value: this
-    # is how `approve` reports the RESOLVED grant lifetime (default-filled) even
-    # though the pending row stored None. Otherwise the row's own stamped TTL is
-    # carried through. `row["ttl_seconds"]` exists on every row because the
-    # migration adds the column before any read (R26).
+    # A given `ttl_seconds` overrides the row's stored value: this is how
+    # `approve` reports the resolved grant lifetime even though the pending row
+    # stored None. Otherwise the row's own stamped TTL is carried through.
     row_keys = row.keys()
     stored_ttl = row["ttl_seconds"] if "ttl_seconds" in row_keys else None
     return PendingApproval(

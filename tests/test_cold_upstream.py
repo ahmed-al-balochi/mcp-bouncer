@@ -1,33 +1,6 @@
-"""Bug D5.3/D5.8: the first MCP session on a cold task collided because a slow
-lazy stdio-upstream spawn made an auto front fall back from modern to legacy,
-and the proxy's era MIRRORING then asked the ONE shared kept-alive stdio
-transport for two different TransportOptions -- which StdioTransport refuses.
-
-Two fixes, each proven here by a test that FAILS without its part:
-
-* Part 2 (pin the backend era). With mirroring left on (`proxy_mode=None`, the
-  pre-fix behaviour) and NO warm-up, two concurrent fronts of different eras --
-  an auto front whose modern discover probe times out against the cold child,
-  and a legacy front -- ask the shared transport for different options and one
-  collides with the exact RuntimeError. With the pin
-  (`BACKEND_PROXY_MODE = "legacy"`), a legacy front AND an auto front both
-  succeed against the same cold upstream. Removing the pin re-breaks this.
-
-* Part 1 (warm the upstream at boot). `warm_up_upstream` spawns the child and
-  establishes the shared session before serving, emitting one `upstream_ready`
-  log line with the spawn duration; an unreachable upstream refuses to boot with
-  an actionable message; and the warm-up itself uses the SAME pinned options, so
-  it cannot create the very mismatch the pin removes.
-
-Speed: the real 10 s discover timeout is monkeypatched down to ~1 s and the
-child sleeps ~2 s, so the whole file targets < 15 s while preserving the exact
-ordering (spawn slower than the discover timeout).
-
-No AWS, loopback only, SQLite store (R45). The slow upstream is a spawned stdio
-script under tests/ -- an in-memory FastMCP upstream has no StdioTransport and so
-cannot reproduce the bug at all; the deployed path is stdio (R35), so the
-regression must drive stdio.
-"""
+"""A cold stdio upstream must still serve mixed-era fronts without colliding.
+Part 2 pins the backend era so one shared transport is never asked for two
+option sets. Part 1 warms the upstream at boot so no request pays the spawn cost."""
 
 from __future__ import annotations
 
@@ -92,14 +65,9 @@ def _await_listening(host: str, port: int, timeout: float = 15.0) -> None:
 
 @pytest.fixture
 def cold_upstream_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provide a local token source and shrink the front discover timeout.
-
-    Shrinking `DISCOVER_TIMEOUT_SECONDS` to ~1 s is what lets a ~2 s baked delay
-    reproduce the production ordering (spawn slower than the discover timeout) in
-    a fraction of the wall-clock time. The delay itself is baked into the
-    generated child script (see `write_slow_upstream`), because the spawned child
-    does not inherit arbitrary env vars.
-    """
+    """Provide a local token source and shrink the front discover timeout, so a
+    ~2 s baked child delay reproduces the production ordering (spawn slower than
+    the probe) quickly."""
     monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
     # The mcp client reads this module-level constant when it builds the auto
     # probe timeout (mcp/client/session.py DISCOVER_TIMEOUT_SECONDS).
@@ -117,12 +85,9 @@ def _cold_gate(
     proxy_mode: str | None = "__default__",
     db_name: str = "cold.db",
 ) -> Any:
-    """Build a gate fronting a freshly generated slow/crashing stdio upstream.
-
-    `proxy_mode="__default__"` leaves `build_gate` on its production default
-    (the pinned `BACKEND_PROXY_MODE`); pass `None` for the pre-fix mirroring
-    behaviour the Part-2 regression needs.
-    """
+    """Build a gate fronting a freshly generated slow or crashing stdio upstream.
+    `proxy_mode="__default__"` keeps the production pinned default; pass `None`
+    for the pre-fix mirroring behaviour the Part 2 regression needs."""
     upstream = write_slow_upstream(tmp_path, delay_seconds=delay_seconds, crash=crash)
     kwargs: dict[str, Any] = {}
     if proxy_mode != "__default__":
@@ -137,13 +102,8 @@ def _cold_gate(
 
 
 def _serve(gate: Any, port: int, *, warm_up: bool) -> None:
-    """Serve on a background thread. `warm_up` selects the production path
-    (warm then serve in one loop) or the pre-fix seam (serve cold).
-
-    The Part-2 regression uses `warm_up=False` to observe the cold-first-request
-    race; the Part-1 tests use `warm_up=True`, which is exactly what `main()`
-    runs in production.
-    """
+    """Serve on a background thread. `warm_up=True` is the production path (warm
+    then serve in one loop); `warm_up=False` serves cold for the Part 2 race."""
     thread = threading.Thread(
         target=lambda: run_http(gate, host="127.0.0.1", port=port, warm_up=warm_up),
         daemon=True,
@@ -168,15 +128,9 @@ async def _read_home(mcp_url: str, front_mode: str) -> Any:
 def test_without_the_pin_a_cold_upstream_collides_on_mixed_eras(
     cold_upstream_env: None, policy_path: Path, tmp_path: Path
 ) -> None:
-    """FAILS WITHOUT PART 2. Mirroring on (`proxy_mode=None`) + no warm-up: two
-    concurrent fronts of different eras hit the ONE cold shared stdio transport
-    with different options, and one gets the exact StdioTransport RuntimeError.
-
-    Concurrency is how the collision is made deterministic: the auto front's
-    modern connect is still in flight (the child is still spawning) when the
-    legacy front's connect arrives with different options, which is precisely
-    the `_active_sessions > 0 and options differ` branch StdioTransport rejects.
-    """
+    """Fails without Part 2. With mirroring on and no warm-up, two concurrent
+    fronts of different eras hit the one cold shared stdio transport with
+    different options and one gets the StdioTransport collision error."""
     gate = _cold_gate(
         tmp_path, policy_path, proxy_mode=None, db_name="collide.db"
     )  # pre-fix: mirror the front era onto the backend
@@ -202,11 +156,9 @@ def test_without_the_pin_a_cold_upstream_collides_on_mixed_eras(
 def test_with_the_pin_a_cold_upstream_serves_both_front_eras(
     cold_upstream_env: None, policy_path: Path, tmp_path: Path
 ) -> None:
-    """FAILS WITHOUT PART 2 would be vacuous here, so this proves the fix: with
-    the default pinned mode, a legacy front AND an auto front each succeed on a
-    cold upstream, because the shared transport only ever sees the one pinned
-    era. Run sequentially so each pays its own cold/first-call cost against the
-    same kept-alive child."""
+    """Proves the Part 2 fix: with the pinned mode a legacy front and an auto
+    front each succeed on a cold upstream, because the shared transport only
+    ever sees the one pinned era. Run sequentially so each pays its own cost."""
     gate = _cold_gate(tmp_path, policy_path, db_name="pinned.db")  # default = pinned
     port = _free_port()
     _serve(gate, port, warm_up=False)
@@ -222,10 +174,9 @@ def test_with_the_pin_a_cold_upstream_serves_both_front_eras(
 
 
 def test_the_pinned_mode_is_legacy() -> None:
-    """Pin down the empirically chosen value so a change is a deliberate edit,
-    not an accident. `legacy` is chosen because it performs no backend discover
-    probe and so cannot itself be timeout-sensitive on a cold child; see the
-    why-comment on BACKEND_PROXY_MODE."""
+    """Pin down the chosen value so a change is deliberate. `legacy` is chosen
+    because it does no backend discover probe, so it cannot be timeout-sensitive
+    on a cold child."""
     assert BACKEND_PROXY_MODE == "legacy"
 
 
@@ -241,14 +192,9 @@ def _capture_logs() -> io.StringIO:
 def test_warm_up_serves_before_the_first_request_and_logs_the_duration(
     cold_upstream_env: None, policy_path: Path, tmp_path: Path
 ) -> None:
-    """FAILS WITHOUT PART 1. Serving through the production path (`run_http` with
-    warm-up) emits one `upstream_ready` line with a duration and tool count
-    BEFORE the listener accepts requests, and the first real call then does NOT
-    pay the cold-spawn cost -- it returns fast because the child is already up.
-
-    Log capture is process-global (the handler lives on the shared `bouncer`
-    logger), so the warm-up emitted on the serving thread lands in this buffer.
-    """
+    """Fails without Part 1. The production path emits one `upstream_ready` line
+    with a duration and tool count before the listener accepts, so the first
+    real call does not pay the cold-spawn cost."""
     buffer = _capture_logs()
     gate = _cold_gate(tmp_path, policy_path, db_name="warm.db")
 
@@ -256,8 +202,7 @@ def test_warm_up_serves_before_the_first_request_and_logs_the_duration(
     _serve(gate, port, warm_up=True)  # warms then serves in one loop
     mcp_url = f"http://127.0.0.1:{port}/mcp/"
 
-    # By the time the socket accepts, warm-up has already run (it precedes
-    # uvicorn in the same loop). Give the log a beat to flush, then assert.
+    # By the time the socket accepts, warm-up has already run. Flush, then assert.
     def _ready_lines() -> list[dict]:
         lines = [json.loads(x) for x in buffer.getvalue().splitlines() if x.strip()]
         return [line for line in lines if line.get("event") == "upstream_ready"]
@@ -285,9 +230,9 @@ def test_warm_up_serves_before_the_first_request_and_logs_the_duration(
 def test_an_unreachable_upstream_refuses_to_boot(
     monkeypatch: pytest.MonkeyPatch, policy_path: Path, tmp_path: Path
 ) -> None:
-    """FAILS WITHOUT PART 1. An upstream that is a valid script but crashes on
-    start (so it never serves MCP) makes the warm-up fail, and the gate refuses
-    to boot with an actionable message rather than serving and failing later."""
+    """Fails without Part 1. An upstream that crashes on start makes warm-up
+    fail, so the gate refuses to boot with an actionable message rather than
+    serving and failing later."""
     monkeypatch.setenv(LOCAL_TOKENS_ENV, json.dumps(TOKENS))
 
     gate = _cold_gate(
@@ -305,15 +250,9 @@ def test_an_unreachable_upstream_refuses_to_boot(
 def test_warm_up_uses_the_pinned_options_so_it_cannot_itself_collide(
     cold_upstream_env: None, policy_path: Path, tmp_path: Path
 ) -> None:
-    """The warm-up connection must adopt the SAME pinned era as real requests, or
-    it would be the first half of a mismatch. Serve through the production path
-    (warm-up then serve, one loop), then drive a real auto front AND a real
-    legacy front concurrently against the now-warm shared transport: with the
-    pin, both succeed and neither hits the collision text.
-
-    This is the safety property called out in the brief: the warm-up session must
-    not create a mismatch of its own.
-    """
+    """The warm-up connection must adopt the same pinned era as real requests,
+    or it would be the first half of a mismatch. With the pin, a real auto front
+    and a real legacy front both succeed against the now-warm shared transport."""
     gate = _cold_gate(tmp_path, policy_path, db_name="warm-pin.db")
 
     port = _free_port()

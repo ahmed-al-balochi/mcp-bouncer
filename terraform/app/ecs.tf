@@ -1,15 +1,6 @@
-# ECS Fargate: one cluster, and the GATE task definition + service (R35). The
-# gate runs over HTTP with the demo upstream spawned over stdio -- the same
-# command the local demo runs, no deployed-only code path. The LiteLLM gateway
-# task/service live in gateway.tf.
-#
-# The gate is now INTERNAL-ONLY (R52): it is reached only by the LiteLLM gateway
-# over ECS Service Connect, never from the ALB. It is registered as a Service
-# Connect SERVER (the gateway is the client).
-#
-# Task size is set by the owner at 0.5 vCPU / 1 GB (D6.9): cpu 512, memory 1024.
-# Raised from 0.25/512 (D4.3) because the Service Connect sidecar wants +256 CPU
-# and >=64 MiB per task, and Fargate requires >=1024 MB once CPU is 512.
+# ECS Fargate: one cluster, and the gate task definition and service. The gate is
+# internal-only, reached only by the LiteLLM gateway over Service Connect (it is
+# the server), never from the ALB. Task size is 0.5 vCPU / 1 GB to fit the sidecar.
 
 resource "aws_ecs_cluster" "this" {
   name = var.project_name
@@ -31,21 +22,13 @@ resource "aws_ecs_task_definition" "this" {
     cpu_architecture        = var.cpu_architecture
   }
 
-  # Task-level ephemeral volume mounted at /tmp. The image runs with
-  # readonlyRootFilesystem = true, but the process needs a writable /tmp (Python
-  # may write there, and BOUNCER_DB would land there if SQLite were ever used).
-  # Fargate does NOT support linuxParameters.tmpfs, so a task-level volume is the
-  # only way to get a writable path under a read-only root.
-  #
-  # UNVERIFIED: whether this volume is writable by uid 10001 specifically. A
-  # Fargate ephemeral volume's ownership at mount time is not something this
-  # file can prove; confirm at first boot in phase 5. If it mounts root-owned
-  # and unwritable for 10001, the fix is a small entrypoint chown or an fsGroup
-  # equivalent -- deferred, not solved here.
+  # Task-level ephemeral volume mounted at /tmp. The image runs with a read-only
+  # root but needs a writable /tmp, and Fargate does not support tmpfs, so a
+  # task-level volume is the only way; uid 10001 write access is confirmed at boot.
   volume {
     name = "tmp"
     # Written out because AWS stores it; omitting it made every plan replace the
-    # task definition (DECISIONS D4.14).
+    # task definition.
     configure_at_launch = false
   }
 
@@ -55,11 +38,9 @@ resource "aws_ecs_task_definition" "this" {
       image     = local.container_image
       essential = true
 
-      # Keep the image's own CMD: it already runs `bouncer-server --upstream
-      # demo/wiki_server.py --transport http --host 0.0.0.0 --port 8000`
-      # (verified in Dockerfile), which is exactly what the deploy needs, so no
-      # command override. --transport http is present, so the bearer-token model
-      # is in force.
+      # Keep the image's own CMD: it already runs bouncer-server over http on
+      # port 8000 (verified in Dockerfile), exactly what the deploy needs, so no
+      # command override. --transport http means the bearer-token model is in force.
 
       user = "10001"
 
@@ -77,12 +58,12 @@ resource "aws_ecs_task_definition" "this" {
         {
           containerPort = local.container_port
           # awsvpc requires hostPort == containerPort; AWS fills it in if
-          # omitted, which Terraform then sees as drift (D4.14).
+          # omitted, which Terraform then sees as drift.
           hostPort = local.container_port
           protocol = "tcp"
-          # Named for ECS Service Connect (D6.8): the service's server config
-          # references this port by name. appProtocol http so the sidecar speaks
-          # HTTP to the gate (enabling per-request timeouts and HTTP metrics).
+          # Named for ECS Service Connect: the service's server config references
+          # this port by name. appProtocol http so the sidecar speaks HTTP to the
+          # gate, enabling per-request timeouts and HTTP metrics.
           name        = "gate"
           appProtocol = "http"
         }
@@ -102,17 +83,9 @@ resource "aws_ecs_task_definition" "this" {
         }
       }
 
-      # Container health check via Python (D6.10). The gate is no longer behind
-      # the ALB (R52), so the ALB target-group probe that used to replace a
-      # wedged task is gone; without a container check a hung gate would never be
-      # replaced. The image is python:3.12-slim (root Dockerfile FROM), which has
-      # `python` on PATH but neither curl nor wget, so the check is a one-line
-      # urllib GET of the unauthenticated /health route that exits non-zero
-      # unless it returns HTTP 200.
-      #
-      # startPeriod is 90 s: the stdio upstream warm-up measured ~18 s at 0.25
-      # vCPU (D5.10) and the gate turns healthy only after it; 90 s leaves ample
-      # margin at 0.5 vCPU so a slow cold start is not counted as a failure.
+      # Container health check via Python, since the gate is no longer behind the
+      # ALB: a one-line urllib GET of /health (the image has no curl or wget) that
+      # exits non-zero unless HTTP 200. startPeriod 90 s covers the stdio warm-up.
       healthCheck = {
         command = [
           "CMD",
@@ -133,8 +106,7 @@ resource "aws_ecs_task_definition" "this" {
         { name = "BOUNCER_IDENTITY", value = "secretsmanager" },
         # The secret's ARN; the app resolves it at boot via get_secret_value.
         # Passed as a plain env var (not an ECS `secrets` block) because the app
-        # itself reads BOUNCER_TOKENS_SECRET and calls Secrets Manager -- the ARN
-        # is an identifier, not a credential.
+        # reads BOUNCER_TOKENS_SECRET itself; the ARN is an identifier, not a secret.
         { name = "BOUNCER_TOKENS_SECRET", value = aws_secretsmanager_secret.tokens.arn },
         { name = "BOUNCER_STORE", value = "dynamodb" },
         { name = "BOUNCER_DYNAMODB_TABLE", value = aws_dynamodb_table.approvals.name },
@@ -145,23 +117,15 @@ resource "aws_ecs_task_definition" "this" {
         { name = "AWS_REGION", value = var.aws_region },
         { name = "AWS_DEFAULT_REGION", value = var.aws_region },
         { name = "BOUNCER_LOG_LEVEL", value = "INFO" },
-        # FORWARDED_ALLOW_IPS is deliberately removed. It existed so uvicorn
-        # would trust the ALB's X-Forwarded-Proto and not downgrade a `/mcp/`
-        # redirect to http:// (D4.16). The gate is no longer behind the ALB
-        # (R52): only the LiteLLM gateway reaches it, in-cluster over Service
-        # Connect, addressed as http://gate:8000/mcp with no trailing slash and
-        # no TLS-terminating proxy in front, so there is no X-Forwarded-Proto to
-        # trust and no scheme-downgrade redirect to guard against. The Python
-        # regression test in tests/test_health.py sets this variable itself and
-        # pins uvicorn's behaviour at the app level; it does not read the
-        # Terraform value, so it is unaffected by this removal.
-        # No BOUNCER_POLICY: the image's WORKDIR is /app and policy.yaml is at
-        # /app/policy.yaml, so the registry's default path (cwd/policy.yaml)
-        # already resolves it (verified in gate/registry.py default_policy_path).
+        # FORWARDED_ALLOW_IPS is deliberately removed: it let uvicorn trust the
+        # ALB's X-Forwarded-Proto, but the gate is no longer behind the ALB, so
+        # there is no proxy header to trust and no scheme downgrade to guard.
+
+        # No BOUNCER_POLICY: WORKDIR is /app and policy.yaml is at /app/policy.yaml,
+        # which the registry's default path already resolves.
       ]
 
-      # Empty lists AWS adds on storage; declared so the plan shows no drift
-      # (D4.14).
+      # Empty lists AWS adds on storage; declared so the plan shows no drift.
       systemControls = []
       volumesFrom    = []
 
@@ -198,17 +162,12 @@ resource "aws_ecs_service" "this" {
   }
 
   # No load_balancer block and no health_check_grace_period_seconds: the gate is
-  # internal-only now (R52), reached over Service Connect, not through the ALB.
-  # ECS rejects healthCheckGracePeriodSeconds unless the service has a load
-  # balancer, so it must go with the load_balancer block; the container-level
-  # healthCheck (with its 90 s startPeriod) covers the boot warm-up instead.
-  #
-  # Register the gate as a Service Connect SERVER so the LiteLLM gateway can
-  # reach it as `gate` (D6.8, D6.10). The server advertises the named port
-  # "gate" under the DNS alias `gate` on port 8000. Timeouts are set explicitly
-  # (perRequest 120 s, idle 300 s) so a slow model/tool round or an SSE stream is
-  # not cut at the 15 s default (D6.8/D6.10). The Envoy sidecar logs to its own
-  # log group.
+  # internal-only, reached over Service Connect. ECS rejects the grace period
+  # without a load balancer; the container healthCheck covers the boot warm-up.
+
+  # Register the gate as a Service Connect server so the gateway can reach it as
+  # `gate` on port 8000. Timeouts are explicit (perRequest 120 s, idle 300 s) so
+  # a slow model/tool round or SSE stream is not cut at the 15 s default.
   service_connect_configuration {
     enabled   = true
     namespace = aws_service_discovery_http_namespace.this.arn
@@ -244,21 +203,13 @@ resource "aws_ecs_service" "this" {
     rollback = true
   }
 
-  # ECS Exec is off: it would require ssmmessages VPC endpoints, which this
-  # no-internet network deliberately does not provision. Turning it on without
-  # those endpoints would just fail; if interactive debugging is ever needed,
-  # add the ssmmessages endpoints first.
+  # ECS Exec is off: it would require ssmmessages VPC endpoints this no-internet
+  # network does not provision. Add those endpoints first if debugging is needed.
   enable_execute_command = false
 
-  # The service depends on the endpoints and routes existing, or the first task
-  # cannot pull its image or reach DynamoDB. Terraform infers most of this from
-  # references, but the gateway route associations are not referenced by the
-  # service, so make the ordering explicit.
-  #
-  # The secret VERSION too: the task definition references only the secret's
-  # ARN, which exists before any value is written. A task that booted in that
-  # gap would find no token map and refuse to boot -- and on a first deployment
-  # the circuit breaker can mark that as a failed rollout rather than retrying.
+  # The service depends on the endpoints, routes and the secret version existing,
+  # or the first task cannot pull its image, reach DynamoDB, or find its token
+  # map; some of these are not referenced by the service, so order them here.
   depends_on = [
     aws_secretsmanager_secret_version.tokens,
     aws_vpc_endpoint.s3,

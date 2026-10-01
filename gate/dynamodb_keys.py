@@ -1,13 +1,7 @@
 """Sort-key encoding shared by the DynamoDB backends.
 
-DynamoDB compares string sort keys lexically, not numerically, so an epoch
-timestamp used as a sort key has to be fixed width and zero padded or
-"1000000.0" would sort before "9999.0" and every range query would be wrong.
-
-Both DynamoDB backends need this and neither owns it, so it lives here rather
-than being copied into each. Sixteen integer digits covers epoch seconds well
-past any plausible lifetime of a deployment; six decimals preserve sub-second
-ordering.
+DynamoDB compares string sort keys lexically, so an epoch timestamp sort key
+must be fixed width and zero padded or "1000000.0" would sort before "9999.0".
 """
 
 from __future__ import annotations

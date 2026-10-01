@@ -1,18 +1,6 @@
-"""DynamoDB-specific properties that the shared contract suite cannot express.
-
-The parametrised suite in ``test_approvals.py`` proves the DynamoDB store honours
-the same contract as SQLite (A8). These tests reach past the interface to assert
-the *mechanism* the requirements name explicitly:
-
-* the one-shot claim is a conditional delete that yields exactly one winner even
-  when many callers race it (R27),
-* expiry is refused at claim time by the condition itself, so a stale grant that
-  TTL has not yet physically removed is still denied while its item is provably
-  still in the table (R28),
-* the rolling-window count is a key-range Query that stays correct as releases
-  fall out of the window across the hour boundary (R14, R28).
-
-All of it runs against a moto fake: no AWS credentials, no network (R45).
+"""DynamoDB-specific properties the shared contract suite cannot express.
+These assert the mechanism directly: a one-shot conditional delete with one
+winner, expiry refused at claim time, a key-range window Query.
 """
 
 from __future__ import annotations
@@ -99,12 +87,9 @@ def make_store(dynamodb_client: Any) -> Callable[..., Any]:
 def test_concurrent_consume_produces_exactly_one_winner_on_dynamodb(
     make_store: Callable[..., Any]
 ):
-    """The whole point of the DynamoDB backend: one grant, one release, under a race.
-
-    Eight threads claim the same grant at once. The conditional delete lets the
-    single winner remove the item; every other thread gets ConditionalCheckFailed
-    and returns False. Exactly one True, and the caller's window count is 1 -- the
-    release was recorded once, not once per racer.
+    """One grant, one release, under a race: exactly one winner on DynamoDB.
+    Eight threads claim the same grant. The conditional delete lets one win; the
+    rest get ConditionalCheckFailed, so the window count is 1, not 8.
     """
     store = make_store()
     parked = store.create(CALLER, TOOL, PAGE_7)
@@ -121,13 +106,9 @@ def test_concurrent_consume_produces_exactly_one_winner_on_dynamodb(
 def test_expired_grant_is_refused_while_its_item_still_physically_exists(
     make_store: Callable[..., Any], dynamodb_client: Any
 ):
-    """R28: expiry is enforced by the claim condition, not by trusting async TTL.
-
-    The grant is left physically present -- no ``expire()`` sweep, no TTL deletion
-    -- and the clock is wound past its TTL. ``consume`` must still refuse it,
-    because the conditional delete carries ``expires_at > now``. We then read the
-    item straight from the table to prove it was the condition that refused the
-    claim, not a prior deletion: the stale item is provably still there.
+    """Expiry is enforced by the claim condition, not by trusting async TTL.
+    The grant is left physically present and the clock wound past its TTL; consume
+    must still refuse it, and reading the item back proves the condition did it.
     """
     clock = _Clock()
     store = make_store(clock=clock)
@@ -159,17 +140,8 @@ def test_two_releases_in_the_same_clock_tick_are_both_counted(
     make_store: Callable[..., Any]
 ):
     """The rate cap must not be defeated by two releases sharing a timestamp.
-
-    Releases are stored under PK=RELEASE#<caller> with the timestamp in the sort
-    key. If the sort key were the timestamp alone, two grants claimed by one
-    caller within the same clock tick would write the same PK and SK and the
-    second PutItem would silently overwrite the first -- the window would count
-    one, and a caller could slip past the destructive cap (R14). The sort key
-    therefore carries the argument digest as well.
-
-    The frozen clock makes the collision certain rather than unlikely, which is
-    the only way to test it deterministically: with a real clock the two writes
-    would land microseconds apart and pass either way.
+    If the sort key were the timestamp alone they would overwrite and the window
+    would undercount. The frozen clock makes the collision deterministic.
     """
     clock = _Clock()
     store = make_store(clock=clock)
@@ -187,11 +159,8 @@ def test_window_query_is_correct_across_the_hour_boundary(
     make_store: Callable[..., Any]
 ):
     """approved_in_window counts only releases inside the rolling hour, via a key range.
-
-    Two releases are recorded, then the clock advances so the first falls outside
-    the hour while the second stays inside. The count must drop from two to one to
-    zero as the window slides -- exactly the behaviour a Query with an ``SK >
-    cutoff`` key-range condition produces, and never what a whole-table Scan would.
+    As the clock slides, two releases drop to one then zero, which a Query with an
+    SK > cutoff condition produces and a whole-table Scan never would.
     """
     clock = _Clock()
     store = make_store(clock=clock)
@@ -219,12 +188,9 @@ def test_window_query_is_correct_across_the_hour_boundary(
 def test_native_ttl_attribute_matches_the_per_row_expiry(
     make_store: Callable[..., Any], dynamodb_client: Any
 ):
-    """R26 / D5.2: the grant's native `ttl` is computed from the per-row TTL.
-
-    Park with a 5-minute TTL against a store whose default is 10 minutes, approve,
-    then read the grant item straight from the table. Both `expires_at` and the
-    native `ttl` attribute must sit at approve-time + 5 minutes, not + 10. On the
-    unfixed code both were written from the 10-minute store default.
+    """The grant's native `ttl` is computed from the per-row TTL.
+    Park with a 5-minute TTL against a 10-minute store, approve, then read it.
+    Both `expires_at` and `ttl` must be approve-time + 5 minutes, not + 10.
     """
     clock = _Clock()
     store = make_store(clock=clock)

@@ -1,34 +1,6 @@
-"""A stdio MCP upstream that delays its own start-up, used to reproduce the
-cold-spawn era-collision (bug D5.3/D5.8) deterministically in a unit test.
-
-Why this exists as a real spawned script rather than an in-memory server:
-
-    The collision is a property of fastmcp's ONE shared ``StdioTransport`` with
-    ``keep_alive=True`` that the proxy spawns lazily on the first request. An
-    in-memory ``FastMCP`` upstream is not spawned and has no ``StdioTransport``,
-    so it cannot reproduce the bug at all. The bug only lives on the stdio
-    (script-path / command) transport, which is exactly the deployed path (R35),
-    so the regression test must drive that path.
-
-Why the delay is BAKED into a generated launcher rather than read from an env var:
-
-    fastmcp spawns the child through the MCP SDK's ``stdio_client``, which does
-    NOT inherit the parent's arbitrary environment -- only a small safe allowlist
-    (``mcp.client.stdio.DEFAULT_INHERITED_ENV_VARS``: PATH, HOME, ...). So a
-    ``SLOW_UPSTREAM_DELAY`` env var set in the test would never reach the child.
-    The delay therefore has to be part of the script the child runs. `write_slow_upstream`
-    generates a tiny self-contained launcher (in the test's ``tmp_path``) whose
-    delay and crash flag are literals, and that launcher calls ``run`` here.
-
-Why a sleep before serving reproduces it:
-
-    In production the trigger is a cold child on 0.25 vCPU Fargate whose Python +
-    fastmcp import takes longer than the client's ``DISCOVER_TIMEOUT_SECONDS``
-    (10 s), so the modern ``server/discover`` probe times out and the front
-    falls back to the legacy handshake. The two eras then ask the one shared
-    stdio transport for different ``TransportOptions`` and ``StdioTransport``
-    refuses. A test cannot wait 10 s, so it shrinks the timeout to ~1 s and bakes
-    a ~2 s delay: the same ordering, in a fraction of the wall-clock time.
+"""A stdio MCP upstream that delays its start-up to reproduce the cold-spawn
+era-collision in a test. It must be a real spawned script on the stdio transport,
+the deployed path, with the delay baked into the launcher it runs.
 """
 
 from __future__ import annotations
@@ -39,18 +11,14 @@ from pathlib import Path
 
 def run(*, delay_seconds: float = 0.0, crash: bool = False) -> None:
     """Sleep, then either crash (never serve) or serve a tiny wiki over stdio.
-
-    The sleep happens BEFORE importing/building fastmcp, so the child is
-    demonstrably not answering for the whole delay -- mimicking a slow cold
-    interpreter + import, which is what makes the modern probe time out.
+    The sleep happens before importing fastmcp, so the child is not answering
+    for the whole delay, mimicking a slow cold interpreter and import.
     """
     time.sleep(max(0.0, delay_seconds))
 
-    # A crash seam: exit WITHOUT serving MCP, so the proxy's warm-up connection
-    # fails to initialise. This exercises the refuse-to-boot path for an upstream
-    # that IS a valid script (so create_proxy builds a transport) but cannot
-    # actually be reached -- distinct from a bad path, which create_proxy rejects
-    # earlier.
+    # Crash seam: exit without serving MCP so the proxy's warm-up connection
+    # fails. This is a valid script that cannot be reached, distinct from a bad
+    # path that create_proxy rejects earlier.
     if crash:
         raise SystemExit(17)
 
@@ -86,14 +54,11 @@ def run(*, delay_seconds: float = 0.0, crash: bool = False) -> None:
 def write_slow_upstream(
     directory: Path, *, delay_seconds: float = 0.0, crash: bool = False
 ) -> Path:
-    """Write a self-contained launcher script into ``directory`` and return it.
-
-    The launcher puts the tests package's parent on ``sys.path`` (the child
-    inherits PATH but not this process's ``sys.path``) and calls ``run`` with the
-    delay and crash flag baked in as literals, so no environment inheritance is
-    needed. Returns the script path to hand to ``build_gate`` as the upstream.
+    """Write a self-contained launcher into ``directory`` and return its path.
+    It puts the project root on sys.path (the child does not inherit it) and
+    calls ``run`` with the delay and crash flag baked in as literals.
     """
-    tests_parent = Path(__file__).resolve().parent.parent  # the project root
+    tests_parent = Path(__file__).resolve().parent.parent  # project root
     script = directory / "slow_upstream_launcher.py"
     script.write_text(
         "import sys\n"

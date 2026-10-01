@@ -1,19 +1,6 @@
-"""The ALB health endpoint: open, minimal, and not an authentication bypass (R31).
-
-Two levels of exercise:
-
-* Through the real ASGI app (`http_app()`) with Starlette's ASGI-capable
-  TestClient, which dispatches in-process without a socket, so the route is
-  proven the way a load balancer would hit it -- not by calling the handler
-  function directly.
-* Through a real HTTP listener alongside the MCP endpoint, to prove that opening
-  an unauthenticated health route did not open an unauthenticated tool path: the
-  same server that answers `/health` with no token still rejects a tool call
-  with no token.
-
-No AWS and no external network: the token source is the local `BOUNCER_TOKENS`
-env var and every listener is on loopback (R45).
-"""
+"""The ALB health endpoint: open, minimal, and not an authentication bypass.
+Exercised through the real ASGI app with Starlette's TestClient and through a
+real loopback listener that still rejects an unauthenticated tool call."""
 
 from __future__ import annotations
 
@@ -43,7 +30,7 @@ TOKENS = {DEV_TOKEN: {"caller": "dev-agent", "team": "DevChat"}}
 
 # Strings that would betray something about the deployment if any of them ever
 # appeared in the health response. Asserting on ABSENCE is the point: a 200 with
-# a leaky body still fails R31.
+# a leaky body still fails the no-disclosure rule.
 FORBIDDEN_IN_HEALTH = (
     "0.1.0",  # the package version
     "fastmcp",  # the framework identity
@@ -77,13 +64,9 @@ def test_health_returns_success_with_no_authorization_header(asgi_app: Any):
 
 
 def test_health_response_body_reveals_nothing(asgi_app: Any):
-    """Assert on what is ABSENT from the body, not merely that the status is 200.
-
-    Headers are checked separately, against a real listener: Starlette's
-    in-process TestClient never adds the headers a real ASGI server does, so a
-    header assertion here would pass no matter what the container serves. Body
-    content, by contrast, comes from our own handler and is fully exercised here.
-    """
+    """Assert on what is absent from the body, not merely that the status is 200.
+    The body comes from our own handler, so it is fully exercised here; headers
+    are checked separately against a real listener."""
     with TestClient(asgi_app) as client:
         response = client.get(HEALTH_PATH)
 
@@ -150,14 +133,9 @@ def http_gate(
 def test_health_headers_reveal_nothing_on_a_real_listener(
     http_gate: tuple[str, str],
 ):
-    """The disclosure check that actually covers the deployed artifact.
-
-    A real ASGI server adds headers of its own -- uvicorn sends `Server:` and
-    `Date:` by default -- and an ALB does not strip them, so an unauthenticated
-    probe would otherwise announce the server software. The in-process TestClient
-    cannot see those headers at all, which is why this assertion lives here and
-    runs against the same `run_http` the container invokes.
-    """
+    """The disclosure check that covers the deployed artifact. A real ASGI server
+    adds `Server:` and `Date:` headers and the ALB does not strip them, so an
+    unauthenticated probe would otherwise announce the server software."""
     base, _ = http_gate
 
     with urllib.request.urlopen(f"{base}{HEALTH_PATH}", timeout=5) as response:
@@ -178,17 +156,9 @@ def test_health_headers_reveal_nothing_on_a_real_listener(
 def test_run_http_suppresses_everything_that_would_pollute_the_log_stream(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """R33: stdout must be JSON per line, and R31: the health response must not
-    announce the server.
-
-    Asserting on what `run_http` passes, rather than on the constant, because the
-    defect this guards against is a caller that reaches for the raw fastmcp run
-    entry point directly and silently gets uvicorn's defaults back. `run_http`
-    now warms the upstream and serves in one event loop (bug D5.3/D5.8), so it
-    drives `run_http_async`; the fake captures that call. `warm_up=False` is
-    passed so the fake needs no real upstream -- the header suppression this test
-    guards is independent of the warm-up.
-    """
+    """Assert on what `run_http` passes to uvicorn, because the
+    defect it guards against is a caller that uses the raw fastmcp entry point
+    and silently gets uvicorn's defaults back. `warm_up=False` needs no upstream."""
     captured: dict[str, Any] = {}
 
     class _FakeGate:
@@ -214,10 +184,9 @@ def test_run_http_suppresses_everything_that_would_pollute_the_log_stream(
 def test_health_is_open_while_the_mcp_session_still_requires_a_token(
     http_gate: tuple[str, str],
 ):
-    """The same running server answers /health unauthenticated AND refuses to
-    open an MCP session without a token. Opening health did not open a tool
-    path: under the amended R18 the session itself cannot initialize, so an
-    unauthenticated client cannot even list tools."""
+    """The same running server answers /health unauthenticated yet refuses to
+    open an MCP session without a token, so an unauthenticated client cannot even
+    list tools. Opening health did not open a tool path."""
     base, mcp_url = http_gate
 
     # Health: no Authorization header, still 200.
@@ -235,16 +204,13 @@ def test_health_is_open_while_the_mcp_session_still_requires_a_token(
         asyncio.run(_list())
 
 
-# --- the 401 itself leaks nothing (R18 disclosure checks) -----------------
+# --- the 401 itself leaks nothing (disclosure checks) -----------------
 
 
 def _post_mcp_unauthenticated(mcp_url: str) -> tuple[int, dict[str, str], str]:
-    """POST an MCP initialize to the endpoint with no token, on the real listener.
-
-    Returns (status, headers-lower, body). urllib raises HTTPError on a 4xx, so
-    the error object -- which is itself the response -- is used to read the 401's
-    headers and body exactly as they went over the socket.
-    """
+    """POST an MCP initialize with no token on the real listener, returning
+    (status, lowercased headers, body). urllib raises HTTPError on a 4xx, whose
+    error object is the response, so the 401 is read exactly as it went out."""
     body = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -284,20 +250,16 @@ def _post_mcp_unauthenticated(mcp_url: str) -> tuple[int, dict[str, str], str]:
 def test_the_401_reveals_no_token_config_or_resource_metadata(
     http_gate: tuple[str, str],
 ):
-    """The unauthenticated 401 must leak nothing useful.
-
-    No base_url is configured, so fastmcp advertises no protected-resource
-    metadata URL in WWW-Authenticate and registers no well-known route. The body
-    is the SDK's fixed `invalid_token` shape -- no token, no team, no backend, no
-    file names.
-    """
+    """The unauthenticated 401 must leak nothing useful. With no base_url
+    configured, fastmcp advertises no resource-metadata URL and the body is the
+    SDK's fixed `invalid_token` shape, naming no token, team, backend or file."""
     _, mcp_url = http_gate
     status, headers, body = _post_mcp_unauthenticated(mcp_url)
 
     assert status == 401
 
     # WWW-Authenticate challenges as Bearer but advertises no resource-metadata
-    # URL, because none is configured -- so it points a client at nothing.
+    # URL, because none is configured, so it points a client at nothing.
     www_auth = headers.get("www-authenticate", "")
     assert www_auth.lower().startswith("bearer")
     assert "resource_metadata" not in www_auth
@@ -312,7 +274,7 @@ def test_the_401_carries_no_server_or_date_header_on_the_real_listener(
     http_gate: tuple[str, str],
 ):
     """The Server:/Date: suppression that applies to /health must apply to the
-    401 too -- it is served by the same uvicorn, so run_http's header
+    401 too, since it is served by the same uvicorn and run_http's header
     suppression covers it."""
     _, mcp_url = http_gate
     status, headers, _ = _post_mcp_unauthenticated(mcp_url)
@@ -377,14 +339,9 @@ def _slash_redirect_location(port: int) -> str:
 def test_a_redirect_behind_a_trusted_proxy_keeps_https(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ) -> None:
-    """Behind the ALB, a redirect must not downgrade the client to plain HTTP.
-
-    TLS ends at the load balancer, so the gate sees HTTP. If it ignored the
-    ALB's X-Forwarded-Proto, Starlette's `/mcp/` -> `/mcp` redirect would point
-    at http://, and a client that follows it re-sends the request body in
-    cleartext. This pins that `run_http` leaves uvicorn's proxy-header handling
-    on, so trusting the proxy (FORWARDED_ALLOW_IPS) is enough.
-    """
+    """Behind the ALB, TLS ends at the load balancer so the gate sees HTTP.
+    Ignoring X-Forwarded-Proto would make the `/mcp/` redirect point at http://
+    and leak the resent body in cleartext, so run_http keeps proxy headers on."""
     port = _start_listener(monkeypatch, tmp_path, policy_path, trusted="127.0.0.1")
     assert _slash_redirect_location(port).startswith("https://gate.example.test/")
 
@@ -392,12 +349,8 @@ def test_a_redirect_behind_a_trusted_proxy_keeps_https(
 def test_an_untrusted_forwarded_proto_is_ignored(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_path: Path
 ) -> None:
-    """The header is honoured only from the trusted network, never from anyone.
-
-    With the listener trusting a network the request does not come from, the
-    same forged X-Forwarded-Proto has no effect. This is what scoping the trust
-    to the ALB's subnets buys, and it proves the previous test passes because of
-    the trust setting rather than unconditionally.
-    """
+    """The header is honoured only from the trusted network. Trusting a network
+    the request does not come from makes the forged X-Forwarded-Proto inert,
+    proving the previous test passes because of the trust setting, not always."""
     port = _start_listener(monkeypatch, tmp_path, policy_path, trusted="10.99.0.0/24")
     assert _slash_redirect_location(port).startswith("http://gate.example.test/")

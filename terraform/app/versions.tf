@@ -1,7 +1,7 @@
 terraform {
-  # Match the bootstrap stack: a floor recent enough for the features used here
-  # (optional object attributes, the `http` data source), and a ceiling that
-  # keeps a major provider bump from silently changing behaviour on apply.
+  # The floor is recent enough for the features used here (optional object
+  # attributes, the `http` data source); the ceiling keeps a major provider
+  # bump from silently changing behaviour on apply.
   required_version = ">= 1.5"
 
   required_providers {
@@ -10,13 +10,13 @@ terraform {
       version = ">= 5.40, < 7.0"
     }
     # Only used to discover the applier's own public IP when allowed_cidrs is
-    # left null (R37). A read from a single well-known URL; no state footprint.
+    # left null. A read from a single well-known URL; no state footprint.
     http = {
       source  = "hashicorp/http"
       version = ">= 3.4, < 4.0"
     }
     # random_password generates the bearer tokens at provision time so no human
-    # authors one and none is ever committed (R19).
+    # authors one and none is ever committed.
     random = {
       source  = "hashicorp/random"
       version = ">= 3.5, < 4.0"

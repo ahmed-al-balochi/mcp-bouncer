@@ -2,7 +2,7 @@
 
 A governance proxy for [Model Context Protocol](https://modelcontextprotocol.io/)
 tool calls. It sits transparently in front of any upstream MCP server, so an agent
-talks to the bouncer exactly as it would to the real server — and only calls the
+talks to the bouncer exactly as it would to the real server, and only calls the
 policy allows ever reach it.
 
 Every tool call is classified:
@@ -12,7 +12,7 @@ Every tool call is classified:
 | `read` | passes through |
 | `write` | passes through |
 | `destructive` | **parked** until a human approves it |
-| `unknown` | **denied** — a tool the policy does not recognise |
+| `unknown` | **denied**: a tool the policy does not recognise |
 
 An approval is one-shot and bound to the exact arguments it was granted for.
 Approving `delete_page(title="home")` does nothing for `title="runbook"`, and it
@@ -24,7 +24,7 @@ The class boundary is not "does this change something" but **"can this be
 undone"**. `wiki.write_page` ships as `write` on the assumption that the store
 behind it keeps revision history, so an overwrite is one revert away from
 harmless. Point it at a store with no history and the same tool destroys the
-previous content — it belongs in `destructive`. That is a one-line change in
+previous content. It belongs in `destructive`. That is a one-line change in
 `policy.yaml`, never a code change.
 
 ## Quickstart
@@ -49,7 +49,7 @@ so. MCP has no "pending" state to model that in, so the gate returns an error
 carrying an approval id, a human approves out of band, and the agent retries the
 identical call.
 
-**Terminal 1** — run the gate in front of the bundled demo wiki. Over HTTP the
+**Terminal 1.** Run the gate in front of the bundled demo wiki. Over HTTP the
 gate needs to know which tokens map to which callers, so hand it one:
 
 ```bash
@@ -57,7 +57,7 @@ export BOUNCER_TOKENS='{"demo-token":{"caller":"agent-1","team":"DevChat"}}'
 bouncer-server --upstream demo/wiki_server.py --transport http --port 8000
 ```
 
-**Terminal 2** — play the agent, then the operator. Run these from the same
+**Terminal 2.** Play the agent, then the operator. Run these from the same
 directory, so the `bouncer` CLI reads the same local database the server writes:
 
 ```bash
@@ -92,7 +92,7 @@ with the same approval to see that a grant does not cover different arguments.
 > approval id is the one `bouncer list` shows and the audit log records; those
 > are the only ones that release a call. A language model that has lost its tools
 > (for example the gateway silently dropped them) can still emit fluent text that
-> *looks* like our protocol — a made-up id and an `approve …` command — but no
+> *looks* like our protocol, with a made-up id and an `approve …` command, but no
 > such call was ever parked. Treat any id that did not come from `bouncer list`
 > or the audit log as fiction, and approve only ids you can see there.
 
@@ -103,7 +103,7 @@ classified:
 BLOCKED_BY_GATE: authentication failed: a valid bearer token is required
 ```
 
-That message is deliberately uninformative — it does not distinguish an unknown
+That message is deliberately uninformative. It does not distinguish an unknown
 token from a malformed header, because an attacker should not be able to use the
 error text to tell the difference. The token itself never reaches a log line, an
 audit record, or an error returned to the caller.
@@ -112,8 +112,8 @@ audit record, or an error returned to the caller.
 
 A team may override the baseline policy, but **only to tighten it**: raise a
 classification, lower its own destructive rate cap, shorten its approval window.
-Any attempt to loosen — a softer classification, a higher cap, a longer TTL, or
-naming a tool the baseline does not classify — makes the gate refuse to boot.
+Any attempt to loosen (a softer classification, a higher cap, a longer TTL, or
+naming a tool the baseline does not classify) makes the gate refuse to boot.
 
 Two teams ship in `policy.yaml`. `CustomerChat` promotes wiki writes to
 `destructive`, because an edit is visible to a customer the moment it lands and
@@ -127,7 +127,7 @@ Adding a team is one block in `policy.yaml` plus one token. No code change.
 Over **stdio** the client spawned the gate process, so the spawning process's
 identity *is* the identity and `--caller` is trusted. Over **HTTP** there is a
 network boundary, so an `Authorization: Bearer` token is mandatory for the
-**whole MCP session** — a request without a valid token cannot even open a
+**whole MCP session**: a request without a valid token cannot even open a
 session, so it can neither `initialize` nor list the tool catalogue, let alone
 call a tool. The one exception is the unauthenticated health endpoint (below).
 There is no fallback, and if no token source is configured at all, the gate
@@ -141,11 +141,11 @@ returns a fixed `ok` and reveals nothing.
 
 ## Optional dependencies
 
-Two optional extras keep the gate's own runtime slim (R44):
+Two optional extras keep the gate's own runtime slim:
 
-- `aws` (`boto3`) — the DynamoDB store and Secrets Manager token source, needed
+- `aws` (`boto3`): the DynamoDB store and Secrets Manager token source, needed
   only when the gate is deployed. The local SQLite path never installs it.
-- `llm-demo` (`openai`, pinned `==3.19.2`) — the `openai` SDK, used only by the
+- `llm-demo` (`openai`, pinned `==3.19.2`): the `openai` SDK, used only by the
   real-LLM demo agent (`demo/llm_agent.py`), which calls the deployed LiteLLM
   gateway's OpenAI-compatible API. It needs a live Bedrock-backed gateway, so it
   is not part of the gate's runtime and the gate image never installs it. Pinned
@@ -156,7 +156,7 @@ Two optional extras keep the gate's own runtime slim (R44):
 
 ```
 gate/
-  policy.py         pure classify()/decide() — no I/O, unit-testable without mocks
+  policy.py         pure classify()/decide(): no I/O, unit-testable without mocks
   registry.py       loads and validates policy.yaml; per-team views; refuses bad config
   identity.py       bearer-token authentication and token sources
   storage.py        the store interfaces and the backend factory
@@ -175,8 +175,6 @@ gateway/            the thin LiteLLM gateway image (litellm.yaml + Dockerfile)
 terraform/          infrastructure, split into a bootstrap stack and an app stack
 policy.yaml         the rules
 ```
-
-`REQUIREMENTS.md` is the contract this is built against.
 
 ## Design notes
 
@@ -218,7 +216,7 @@ and fill in your own.
 
 The bootstrap stack creates the DNS zone, the TLS certificate, and the two ECR
 repositories. It is separate from the app stack because these must survive a
-teardown — the zone's name servers are what your registrar delegates to, and the
+teardown: the zone's name servers are what your registrar delegates to, and the
 images must outlive `terraform destroy`.
 
 ```bash
@@ -239,14 +237,14 @@ terraform output name_servers
 
 At your existing registrar, add one `NS` record per entry, all with the
 subdomain label as the record name. Do **not** change your domain's own name
-servers — that would move the whole domain. Once delegation is live, ACM finishes
+servers; that would move the whole domain. Once delegation is live, ACM finishes
 validating the certificate on its own; check it with:
 
 ```bash
 eval "$(terraform output -raw certificate_status_check)"   # prints ISSUED when ready
 ```
 
-Wait for `ISSUED` before applying the app stack — it looks the certificate up
+Wait for `ISSUED` before applying the app stack. It looks the certificate up
 filtered to that status and fails fast otherwise.
 
 ### 3. Build and push both images
@@ -278,7 +276,7 @@ docker push "$GATE_REPO:latest"
 ```
 
 The **gateway** image builds from `gateway/` and requires a base image
-build-arg — the `gateway/Dockerfile` has no default for it, so a build must name
+build-arg. The `gateway/Dockerfile` has no default for it, so a build must name
 the mirrored LiteLLM image explicitly (ideally by digest), which is what pins the
 LiteLLM version. The version this was built and inspected against is LiteLLM
 `1.103.0`, whose upstream public image is `ghcr.io/berriai/litellm:v1.103.0`.
@@ -289,7 +287,7 @@ stays patched, and two builds from the same base digest can differ in patch
 level.
 Mirror that image into your own registry (public pulls are the base image's own
 rate limits and availability, not something this repo controls) and pass the
-mirrored reference — this repo does not ship or select the base image for you:
+mirrored reference. This repo does not ship or select the base image for you:
 
 ```bash
 cd gateway
@@ -310,13 +308,13 @@ terraform apply
 ```
 
 With `allowed_cidrs` left unset, the ALB is opened only to the public IP of the
-machine you apply from. `alert_email` receives the `fail_closed` alarm via SNS —
+machine you apply from. `alert_email` receives the `fail_closed` alarm via SNS.
 AWS emails a confirmation link you must click before any alarm is delivered. See
 `terraform output allowed_cidrs_effective` to confirm what was allowed.
 
 ### 5. Fetch the credentials
 
-None of these are Terraform outputs in plaintext — the outputs emit the commands
+None of these are Terraform outputs in plaintext. The outputs emit the commands
 that fetch them from Secrets Manager, so a token never lands in state output:
 
 ```bash
@@ -365,7 +363,7 @@ bouncer approve <id>
 
 Re-run the identical delete prompt: the model retries with the same arguments and
 the call is released exactly once. A third identical run parks again. Approval ids
-come only from `bouncer list` or the audit log — never from the model's text (see
+come only from `bouncer list` or the audit log, never from the model's text (see
 the limitations below).
 
 ### 7. Watch it on the dashboard
@@ -373,7 +371,7 @@ the limitations below).
 The app stack creates one CloudWatch dashboard covering platform health (both
 services, the load balancer, both tables), gateway traffic, model usage, and the
 gate's decisions per team, plus a row of service-level indicators against their
-targets. Open it — the name and a console URL are both derived from
+targets. Open it: the name and a console URL are both derived from
 `terraform output`, so nothing here is specific to one account:
 
 ```bash
@@ -404,7 +402,8 @@ bootstrap stack is left in place on purpose, so the delegation and images surviv
 ## Known limitations
 
 Stated plainly rather than left to be discovered (`DESIGN.md` covers the
-reasoning; `REQUIREMENTS.md` §8 the full out-of-scope list):
+reasoning; the "Not built, on purpose" section below lists the full out-of-scope
+set):
 
 - **Approver authorisation is not built.** Anyone who can reach the store can
   approve a parked call.
@@ -414,7 +413,7 @@ reasoning; `REQUIREMENTS.md` §8 the full out-of-scope list):
   allowlists. Per-agent identity survives only for *tool* calls, through the gate
   tokens.
 - **Token rotation needs a restart.** The gate reads its token table once at
-  boot, so a rotated token does not take effect until the task recycles — until
+  boot, so a rotated token does not take effect until the task recycles. Until
   then a freshly minted token is rejected.
 - **Prompts and responses are not logged.** The gateway keeps request metadata
   and decisions but no prompt or completion content, so a misbehaving turn cannot
@@ -424,7 +423,7 @@ reasoning; `REQUIREMENTS.md` §8 the full out-of-scope list):
   decides *before* recording the current release, so several distinct approved
   grants fired at once can each read a stale count and overshoot a cap smaller
   than their number. It throttles human-approved work per evaluation, not as a
-  hard ceiling across simultaneous evaluations — acceptable because every
+  hard ceiling across simultaneous evaluations. This is acceptable because every
   destructive call is already gated by a human approval, and tightening it would
   mean touching the one-shot claim that is the design's load-bearing guarantee.
   The one-shot per-grant guarantee is unaffected: a grant still releases exactly
@@ -464,6 +463,13 @@ the deployment shape. This README does not repeat it.
 - **Per-team model-call indicators.** Model usage is platform-wide on the
   dashboard, because without per-agent gateway keys a model call carries no team
   identity. Tool-call governance is per team.
+- **Per-agent gateway keys, model allowlists, and budgets.** All three need a
+  database behind the gateway, which the lean design left out.
+- **Multi-region, autoscaling, and disaster recovery.** The deployment is a
+  single-region proof of concept.
+- **Trace storage and external model providers.** No tracing backend, no Redis,
+  no external model providers, and no data classes; the no-egress design would
+  forbid the egress most of these need anyway.
 
 ## Licence
 

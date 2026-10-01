@@ -26,7 +26,7 @@ variable "dns_zone_name" {
     This is normally a subdomain of a domain you already own elsewhere. After
     applying, delegate it by adding NS records for the subdomain label at your
     existing registrar, pointing at this zone's name servers. Do not change your
-    domain's own name servers -- that would move the whole domain.
+    domain's own name servers, which would move the whole domain.
   EOT
   type        = string
 

@@ -45,8 +45,8 @@ class AuditEntry:
 class AuditLog:
     """The decision log, in the same SQLite database as the approvals.
 
-    Append-only is enforced structurally rather than by permissions: this class
-    only ever issues INSERT and SELECT, and exposes no update or delete method.
+    Append-only is structural: this class only issues INSERT and SELECT, and
+    exposes no update or delete method.
     """
 
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:

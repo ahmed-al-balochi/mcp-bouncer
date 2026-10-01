@@ -1,16 +1,6 @@
 """The selection seam: which backend the factory returns, and who actually calls it.
-
-These tests exist because of a real defect. The factory was written correctly and
-then never called: `build_gate` and the CLI both instantiated the SQLite classes
-directly, so `BOUNCER_STORE=dynamodb` was accepted, reported nowhere, and
-silently ignored. Every store test passed, because the stores themselves were
-fine. The behaviour the phase was named after -- choosing a backend by
-configuration -- was the one thing untested.
-
-So this module tests two separate things: that the factory maps configuration to
-the right class, and that the entry points a deployment actually runs go through
-the factory rather than around it.
-"""
+The factory was written and then never called, so BOUNCER_STORE=dynamodb was
+silently ignored. These tests cover the mapping and the real entry points."""
 
 from __future__ import annotations
 
@@ -48,12 +38,9 @@ _AWS_ENV = (
 
 @pytest.fixture
 def dynamodb_backend(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, str]]:
-    """Select the DynamoDB backend, with moto-faked tables that really exist.
-
+    """Select the DynamoDB backend with moto-faked tables that really exist.
     In-process only: moto intercepts boto3, so there are no credentials and no
-    network (R45). The dummy credentials exist solely so boto3 will build a
-    client.
-    """
+    network. The dummy credentials just let boto3 build a client."""
     region = "us-east-1"
     saved = {name: os.environ.get(name) for name in _AWS_ENV}
     for name in _AWS_ENV:
@@ -97,7 +84,7 @@ def _dynamodb_classes() -> tuple[type, type]:
 def test_the_default_backend_is_sqlite(
     monkeypatch: pytest.MonkeyPatch, db_path: Path
 ):
-    """R30: an unset variable must mean SQLite, so local runs stay offline."""
+    """An unset variable must mean SQLite, so local runs stay offline."""
     monkeypatch.delenv(STORE_ENV, raising=False)
 
     assert isinstance(build_approval_store(db_path=db_path), SqliteApprovalStore)
@@ -179,13 +166,9 @@ def test_a_blank_table_name_is_treated_as_missing(monkeypatch: pytest.MonkeyPatc
 def test_both_backends_satisfy_the_declared_protocols(
     monkeypatch: pytest.MonkeyPatch, db_path: Path, dynamodb_backend: dict[str, str]
 ):
-    """The Protocol is the contract, so assert against it rather than trusting it.
-
-    `runtime_checkable` only verifies that the methods exist, not their
-    signatures, so this is a floor and not a proof -- the behavioural parity is
-    what tests/test_approvals.py establishes by running the identical assertions
-    against both backends. Without this, though, the Protocol would be a comment.
-    """
+    """The Protocol is the contract, so assert against it. `runtime_checkable`
+    only checks that methods exist, not their signatures, so this is a floor.
+    The behavioural parity is proven in tests/test_approvals.py."""
     assert isinstance(build_approval_store(), ApprovalStore)
     assert isinstance(build_audit_log(), AuditLog)
 
@@ -198,11 +181,9 @@ def test_both_backends_satisfy_the_declared_protocols(
 
 
 def _captured_middleware(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Capture the stores `build_gate` hands to the middleware.
-
-    Inspecting the constructor arguments rather than reaching into FastMCP's
-    internals keeps the test about the wiring and not about the proxy's shape.
-    """
+    """Capture the stores `build_gate` hands to the middleware. Inspecting the
+    constructor arguments keeps the test about the wiring, not the proxy's
+    shape."""
     captured: dict[str, Any] = {}
 
     class _Capturing(GateMiddleware):
@@ -232,12 +213,9 @@ def test_build_gate_uses_the_sqlite_backend_by_default(
 def test_build_gate_uses_the_configured_backend(
     monkeypatch: pytest.MonkeyPatch, policy_path: Path, dynamodb_backend: dict[str, str]
 ):
-    """The regression guard: the server must go through the factory.
-
-    Before this test existed, `build_gate` imported the factory and then ignored
-    it, so a deployment configured for DynamoDB ran on a per-task SQLite file and
-    the cross-host one-shot guarantee (R27) was quietly lost.
-    """
+    """The regression guard: the server must go through the factory. Before this,
+    build_gate ignored the factory, so a DynamoDB-configured deployment ran on a
+    per-task SQLite file and lost the cross-host one-shot guarantee."""
     from demo.wiki_server import build_server
 
     approval_class, audit_class = _dynamodb_classes()
@@ -252,12 +230,9 @@ def test_build_gate_uses_the_configured_backend(
 def test_the_cli_acts_on_the_configured_backend(
     monkeypatch: pytest.MonkeyPatch, policy_path: Path, dynamodb_backend: dict[str, str]
 ):
-    """R32: an operator approving from a laptop must reach the deployed store.
-
-    Proven by behaviour rather than by types: a call parked directly in the
-    DynamoDB table is visible to `bouncer list` and releasable by
-    `bouncer approve`, which can only work if the CLI resolved the same backend.
-    """
+    """An operator approving from a laptop must reach the deployed store.
+    A call parked directly in the DynamoDB table is visible to `bouncer list`
+    and releasable by `bouncer approve` only if the CLI resolved that backend."""
     store = build_approval_store()
     parked = store.create("agent-1", "wiki.delete_page", {"title": "home"})
 
@@ -281,11 +256,9 @@ def test_the_cli_log_command_reports_a_missing_audit_table_cleanly(
     dynamodb_backend: dict[str, str],
     capsys: pytest.CaptureFixture[str],
 ):
-    """A half-configured backend must produce a message, not a traceback.
-
-    `log` reads only the audit store, so this is the one command that can hit a
-    missing audit table while the approvals table is present.
-    """
+    """A half-configured backend must produce a message, not a traceback. `log`
+    reads only the audit store, so it is the one command that can hit a missing
+    audit table while the approvals table is present."""
     monkeypatch.delenv(DYNAMODB_AUDIT_TABLE_ENV, raising=False)
 
     assert cli.main(["--policy", str(policy_path), "log"]) == 2
@@ -310,11 +283,9 @@ def test_the_factory_passes_an_injected_clock_through(
     dynamodb_backend: dict[str, str],
     backend: str,
 ):
-    """The testable-clock seam has to survive the factory, on either backend.
-
-    Without this, the clock keyword could be silently dropped for one backend and
-    every time-dependent test would quietly measure the wall clock instead.
-    """
+    """The testable-clock seam has to survive the factory on either backend.
+    Otherwise the clock keyword could be dropped for one backend and every
+    time-dependent test would quietly measure the wall clock instead."""
     monkeypatch.setenv(STORE_ENV, backend)
     frozen = 1_234_567.0
 

@@ -1,6 +1,6 @@
-# Outputs an operator needs to use and tear down the stack. Nothing sensitive in
-# plain text: the tokens live only in the secret and in state, and are fetched
-# with the emitted get-secret-value command, never printed here (R19).
+# Outputs an operator needs to use and tear down the stack. Nothing sensitive is
+# in plain text: the tokens live only in the secret and in state, and are fetched
+# with the emitted get-secret-value command, never printed here.
 
 output "gateway_url" {
   description = "The public HTTPS base for the LiteLLM gateway (the only host the ALB serves)."
@@ -40,7 +40,7 @@ output "litellm_log_group_name" {
 output "litellm_master_key_get_command" {
   description = <<-EOT
     Fetch the generated LiteLLM master key from Secrets Manager. Run this rather
-    than exposing the key as a Terraform output (it is LiteLLM's admin key). It
+    than exposing the key as a Terraform output (it is LiteLLM's admin key); it
     is the Authorization: Bearer value an agent uses for model calls.
   EOT
   value       = "aws secretsmanager get-secret-value --region ${var.aws_region} --secret-id ${aws_secretsmanager_secret.litellm_master_key.arn} --query SecretString --output text"
@@ -49,12 +49,8 @@ output "litellm_master_key_get_command" {
 output "agent_mcp_tool_shape" {
   description = <<-EOT
     Shape of the MCP tool block an agent sends to the gateway on
-    /v1/chat/completions. The agent forwards its OWN gate token in the header;
-    fetch a gate token with tokens_get_command. Model calls use the master key
-    (litellm_master_key_get_command) as the request Authorization header.
-      server_label: bouncer
-      server_url:   litellm_proxy/mcp/bouncer
-      header:       x-mcp-bouncer-authorization: Bearer <gate token>
+    /v1/chat/completions. The agent forwards its own gate token in the
+    x-mcp-bouncer-authorization header; model calls use the master key.
   EOT
   value = {
     server_label = "bouncer"
@@ -80,8 +76,8 @@ output "tokens_get_command" {
 output "operator_cli_env" {
   description = <<-EOT
     Export these before running `bouncer approve` / `bouncer list` / `bouncer
-    log` against the deployed DynamoDB store from a laptop (R32). The operator's
-    own AWS credentials must allow the DynamoDB actions on these tables.
+    log` against the deployed DynamoDB store from a laptop. The operator's own
+    AWS credentials must allow the DynamoDB actions on these tables.
   EOT
   value = join(" ", [
     "BOUNCER_STORE=dynamodb",
@@ -103,7 +99,7 @@ output "cluster_name" {
 }
 
 output "dashboard_name" {
-  description = "Name of the CloudWatch dashboard (R58). The README derives it from this output rather than pasting a value."
+  description = "Name of the CloudWatch dashboard. The README derives it from this output rather than pasting a value."
   value       = aws_cloudwatch_dashboard.this.dashboard_name
 }
 
@@ -111,7 +107,7 @@ output "dashboard_url" {
   description = <<-EOT
     Console URL for the CloudWatch dashboard, built from references (the region
     data source and the dashboard name) so no region or account literal is
-    pasted (R2, R3, R39). Open it after `terraform apply`.
+    pasted. Open it after `terraform apply`.
   EOT
   value       = "https://${data.aws_region.current.region}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.region}#dashboards:name=${aws_cloudwatch_dashboard.this.dashboard_name}"
 }

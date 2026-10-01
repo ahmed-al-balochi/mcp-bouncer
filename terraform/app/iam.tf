@@ -1,12 +1,6 @@
-# Least-privilege IAM (R38). Two roles, each with exactly the actions it uses on
-# exactly its own resources. No wildcards on resources anywhere, with the one
-# documented exception AWS itself requires (ecr:GetAuthorizationToken cannot be
-# resource-scoped).
-#
-# These roles reference only resource ARNs (tables, secret, repository, log
-# group). They deliberately do NOT reference the VPC endpoints, so there is no
-# dependency cycle: the endpoint policies reference the role ARNs (one
-# direction), never the reverse.
+# Least-privilege IAM. Two roles, each with exactly the actions it uses on its
+# own resources (no resource wildcards except ecr:GetAuthorizationToken, which
+# AWS forbids scoping). Roles reference only ARNs, never endpoints, so no cycle.
 
 # Both roles are assumed by ECS tasks. The SourceAccount condition prevents the
 # confused-deputy case where another account's ECS service could assume the role
@@ -30,10 +24,10 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
 }
 
 # --- execution role: pulls the image and writes the log stream -------------
-#
-# Deliberately NOT the AWS-managed AmazonECSTaskExecutionRolePolicy: that policy
-# grants ecr:* and logs actions on Resource "*", which R38 forbids. Instead an
-# inline policy scoped to exactly this repository and this log group.
+
+# Deliberately not the AWS-managed AmazonECSTaskExecutionRolePolicy: that grants
+# ecr:* and logs on Resource "*", too broad. Instead an inline policy scoped to
+# exactly this repository and this log group.
 
 resource "aws_iam_role" "execution" {
   name               = "${var.project_name}-execution"
@@ -43,10 +37,8 @@ resource "aws_iam_role" "execution" {
 }
 
 data "aws_iam_policy_document" "execution" {
-  # ECR image pull, scoped to this repository. GetAuthorizationToken is the sole
-  # documented wildcard: AWS scopes it to the whole registry and rejects a
-  # resource-qualified ARN, so it MUST be Resource "*". Every other ECR action
-  # is pinned to the repository ARN.
+  # Image pull, scoped to this repository. GetAuthorizationToken is the one
+  # wildcard: AWS rejects a resource ARN for it, so it has to be Resource "*".
   statement {
     sid       = "EcrAuthToken"
     effect    = "Allow"
@@ -66,14 +58,8 @@ data "aws_iam_policy_document" "execution" {
   }
 
   # Log stream creation and writes, scoped to this task's log group and the
-  # Service Connect sidecar log group, plus their streams. The gate is now a
-  # Service Connect SERVER (ecs.tf), so its task runs an Envoy sidecar whose
-  # awslogs driver uses THIS execution role to create/write streams in the
-  # serviceconnect group (ecs.tf log_configuration -> serviceconnect group).
-  # awslogs stream creation is an execution-role action, and IAM intersects with
-  # the Logs VPC-endpoint policy, so without this group the sidecar's log-stream
-  # creation is denied and the gate task fails to start (R35/R57). Groups are
-  # created in monitoring.tf.
+  # Service Connect sidecar log group. The gate's Envoy sidecar needs this to
+  # create its streams, or the gate task fails to start. Groups in monitoring.tf.
   statement {
     sid    = "LogsWrite"
     effect = "Allow"
@@ -97,11 +83,10 @@ resource "aws_iam_role_policy" "execution" {
 }
 
 # --- task role: the application's own runtime permissions ------------------
-#
-# Exactly the DynamoDB actions the store issues on exactly its two tables (and
-# the approvals table's two GSIs), and GetSecretValue on exactly the token
-# secret. No Scan, no BatchGetItem; no Update/Delete on the audit table so
-# append-only is enforced by IAM as well as structurally (R29).
+
+# Exactly the DynamoDB actions the store issues on its two tables (and the
+# approvals table's two GSIs), and GetSecretValue on the token secret. No Scan,
+# no BatchGetItem; no Update/Delete on the audit table so append-only holds.
 
 resource "aws_iam_role" "task" {
   name               = "${var.project_name}-task"
@@ -131,8 +116,8 @@ data "aws_iam_policy_document" "task" {
     ]
   }
 
-  # Audit table: PutItem and Query ONLY. Deliberately no UpdateItem or
-  # DeleteItem -- append-only enforced by IAM (R29). No GSI, so no index ARN.
+  # Audit table: PutItem and Query only. Deliberately no UpdateItem or
+  # DeleteItem, so append-only is enforced by IAM. No GSI, so no index ARN.
   statement {
     sid    = "AuditTableAppendOnly"
     effect = "Allow"
@@ -160,9 +145,9 @@ resource "aws_iam_role_policy" "task" {
   policy = data.aws_iam_policy_document.task.json
 }
 
-# --- LiteLLM roles (R38, R53, D6.10) ---------------------------------------
-#
-# Separate execution and task roles for the gateway, NOT shared with the gate,
+# --- LiteLLM roles ---------------------------------------------------------
+
+# Separate execution and task roles for the gateway, not shared with the gate,
 # so each is scoped to only what the gateway needs.
 
 # LiteLLM execution role: pull the litellm image, write the gateway and Service
@@ -175,9 +160,9 @@ resource "aws_iam_role" "litellm_execution" {
 }
 
 data "aws_iam_policy_document" "litellm_execution" {
-  # ECR pull scoped to the litellm repository ONLY (D6.10: the reason the two
-  # images are separate repositories). GetAuthorizationToken is the one
-  # unavoidable wildcard AWS will not let us scope.
+  # ECR pull scoped to the litellm repository only (the reason the two images
+  # are separate repositories). GetAuthorizationToken is the one unavoidable
+  # wildcard AWS will not let us scope.
   statement {
     sid       = "EcrAuthToken"
     effect    = "Allow"
@@ -230,12 +215,9 @@ resource "aws_iam_role_policy" "litellm_execution" {
   policy = data.aws_iam_policy_document.litellm_execution.json
 }
 
-# LiteLLM task role: Bedrock ONLY (R53). InvokeModel and
-# InvokeModelWithResponseStream on (1) the EU inference profile ARN and (2) the
-# foundation-model ARNs it routes to. The foundation-model statement is
-# conditioned on bedrock:InferenceProfileArn = the profile ARN, so the role can
-# reach those models only THROUGH the EU profile, never directly (this is A14's
-# IAM layer). All ARNs come from the data source (main.tf), not typed.
+# LiteLLM task role: Bedrock only, on the EU inference profile ARN and the
+# foundation-model ARNs it routes to. The model statement is conditioned on the
+# profile ARN, so the role can reach those models only through the EU profile.
 resource "aws_iam_role" "litellm_task" {
   name               = "${var.project_name}-litellm-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json

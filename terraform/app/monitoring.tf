@@ -1,12 +1,6 @@
-# CloudWatch logs, the fail_closed signal, and its alarm (R33, and NOTES: the
-# fail_closed metric filter is the only signal of a task that booted and then
-# lost its store).
-#
-# The health check is shallow by design (D3.1): a task that boots and then loses
-# its store stays "healthy" while fail-closed blocks every call. The gate emits
-# a JSON line { "event": "fail_closed", ... } on that path (verified in
-# gate/observability.py: log_fail_closed emits event "fail_closed"), so a metric
-# filter on that field is the only operational signal of mid-life store loss.
+# CloudWatch logs, the fail_closed signal, and its alarm. The health check is
+# shallow, so a task that loses its store stays healthy while fail-closed blocks
+# calls; the JSON fail_closed line is the only signal of mid-life store loss.
 
 resource "aws_cloudwatch_log_group" "task" {
   name              = local.log_group_name
@@ -15,8 +9,8 @@ resource "aws_cloudwatch_log_group" "task" {
   tags = { Name = "${var.project_name}-logs" }
 }
 
-# The LiteLLM gateway's own log group (R56): JSON logs to stdout via awslogs,
-# with prompts/responses NOT logged (turn_off_message_logging in the config).
+# The LiteLLM gateway's own log group: JSON logs to stdout via awslogs, with
+# prompts/responses not logged (turn_off_message_logging in the config).
 resource "aws_cloudwatch_log_group" "litellm" {
   name              = local.litellm_log_group_name
   retention_in_days = var.log_retention_days
@@ -67,9 +61,8 @@ resource "aws_cloudwatch_metric_alarm" "fail_closed" {
   comparison_operator = "GreaterThanOrEqualToThreshold"
 
   # With default_value = 0 on the filter, a live task reports 0 every minute, so
-  # missing data means the task is not logging at all -- not itself a fail-closed
-  # condition, so treat it as not breaching to avoid alarming on a quiet or
-  # restarting task.
+  # missing data means the task is not logging at all, not a fail-closed; treat
+  # it as not breaching to avoid alarming on a quiet or restarting task.
   treat_missing_data = "notBreaching"
 
   alarm_actions = [aws_sns_topic.alerts.arn]
@@ -86,10 +79,9 @@ resource "aws_sns_topic" "alerts" {
   tags = { Name = "${var.project_name}-alerts" }
 }
 
-# Email subscription. AWS sends a confirmation link to var.alert_email that MUST
-# be clicked before any notification is delivered; until then the subscription
-# is "PendingConfirmation" and the alarm fires into a void. Terraform cannot
-# confirm it -- that is a human action out of band.
+# Email subscription. AWS sends a confirmation link to var.alert_email that must
+# be clicked before any notification is delivered; until then the subscription is
+# "PendingConfirmation". Terraform cannot confirm it; that is a human action.
 resource "aws_sns_topic_subscription" "email" {
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
