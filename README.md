@@ -1,6 +1,10 @@
 # mcp-bouncer
 
-A governance proxy for [Model Context Protocol](https://modelcontextprotocol.io/)
+An AI platform on AWS built around an MCP governance gate: a single LLM gateway,
+EU-only models, a private tool gate where destructive calls wait for a human,
+and observability.
+
+The gate is a governance proxy for [Model Context Protocol](https://modelcontextprotocol.io/)
 tool calls. It sits transparently in front of any upstream MCP server, so an agent
 talks to the bouncer exactly as it would to the real server, and only calls the
 policy allows ever reach it.
