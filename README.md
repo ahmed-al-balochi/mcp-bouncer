@@ -18,6 +18,41 @@ An approval is one-shot and bound to the exact arguments it was granted for.
 Approving `delete_page(title="home")` does nothing for `title="runbook"`, and it
 releases exactly one call.
 
+## What is in this repo
+
+Two things, built to work together.
+
+**The gate.** The MCP governance proxy above: a Python package with its own
+tests and a demo that runs locally in two minutes with no AWS account.
+
+**A small AI platform around it, on AWS.** The `terraform/` stacks deploy the
+basic pieces a team would put in front of agents:
+
+- **One way in.** A LiteLLM gateway is the only path to models and to tools. It
+  sits behind an HTTPS load balancer on your own domain, limited to an IP
+  allowlist.
+- **EU-only models.** Claude on Amazon Bedrock through the EU inference profile,
+  pinned in three places: the gateway's model list, IAM, and the VPC endpoint
+  policy.
+- **A private gate.** The gate has no public entry point. Only the gateway can
+  reach it, over ECS Service Connect, and each agent forwards its own token so
+  every tool call is attributed to a caller and a team.
+- **No internet path.** Both services run in private subnets with no NAT. They
+  reach AWS only through VPC endpoints, each with a policy scoped to the
+  resources the stack actually uses.
+- **State and secrets.** Approvals and the audit log in DynamoDB, tokens and the
+  gateway key generated at deploy time and kept in Secrets Manager.
+- **Observability.** Structured logs from both services in CloudWatch, ALB
+  access logs in S3, an alarm when the gate fails closed, and a CloudWatch
+  dashboard covering platform health, gateway traffic, model usage, the gate's
+  decisions per team, and service levels against their targets.
+
+![The platform dashboard in CloudWatch](docs/images/dashboard.png)
+
+It is a proof of concept on Fargate, not a product: one task per service, one
+region, and the limits listed under [Known limitations](#known-limitations) and
+[Not built, on purpose](#not-built-on-purpose).
+
 ## Why classification follows reversibility
 
 The class boundary is not "does this change something" but **"can this be
@@ -173,6 +208,7 @@ demo/
                     gate through the LiteLLM gateway (needs the llm-demo extra)
 gateway/            the thin LiteLLM gateway image (litellm.yaml + Dockerfile)
 terraform/          infrastructure, split into a bootstrap stack and an app stack
+docs/images/        the dashboard screenshot
 policy.yaml         the rules
 ```
 
